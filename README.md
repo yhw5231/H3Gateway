@@ -41,11 +41,25 @@
 
 ## 快速开始
 
+从拉取仓库开始，四步跑起来；完整流程（初始化、反向代理、升级、备份、排错）见
+[部署指南](docs/部署指南.md)。
+
+### 第 0 步：拉取仓库
+
+```bash
+git clone https://github.com/yhw5231/H3Gateway.git
+cd H3Gateway
+```
+
+以下命令都在仓库根目录执行。没有 git 时可下载源码包
+（<https://github.com/yhw5231/H3Gateway/archive/refs/heads/main.tar.gz>，解压后目录名为
+`H3Gateway-main`）。
+
 ### 方式一：Docker Compose（推荐）
 
 ```bash
 cp .env.example .env      # 按需修改；不改也能直接跑
-docker compose up -d
+docker compose up -d --build
 ```
 
 打开 <http://127.0.0.1:8787/admin>，用 **admin / admin** 登录。
@@ -493,7 +507,7 @@ curl -X POST http://127.0.0.1:8787/v1/videos \
 │   ├── studio/                网页工作台（来自原版，资源路径已改写）
 │   └── admin/                 后台控制台（index.html / admin.css / admin.js）
 ├── deploy/                    systemd 单元等非容器部署资产
-├── docs/                      上游接口分析、部署与验证记录
+├── docs/                      上游接口分析、部署指南、部署与验证记录
 ├── CHANGELOG.md               更新说明
 └── README.md                  本文件
 ```
@@ -574,5 +588,6 @@ go test ./...             # 全部单元测试（约 40 秒，不需要网络）
 识破退回真实 IP 的情况）、以及全部 HTTP 接口与后台流程。
 
 详细的上游接口分析见 [`docs/上游接口分析.md`](docs/上游接口分析.md)，
+从拉取仓库开始的完整部署流程见 [`docs/部署指南.md`](docs/部署指南.md)，
 部署与验证记录见 [`docs/部署与验证.md`](docs/部署与验证.md)，
 版本变更见 [`CHANGELOG.md`](CHANGELOG.md)。
