@@ -1,0 +1,20 @@
+# 统一使用 LF 换行。
+#
+# 本项目面向 Linux 容器与 systemd 部署：CRLF 会破坏 systemd 单元文件、
+# shell 脚本的 shebang，以及容器内的一切文本处理。因此强制仓库内与检出后
+# 都是 LF，不受各人 core.autocrlf 设置影响。
+* text=auto eol=lf
+
+# 二进制资源不做任何换行转换。
+*.jpg  binary
+*.jpeg binary
+*.png  binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.mp4  binary
+*.woff binary
+*.woff2 binary
+*.ttf  binary
+*.zip  binary
+*.gz   binary

@@ -1,0 +1,20 @@
+# Build context exclusions. Keeping the context small makes image builds fast and
+# prevents local state from leaking into the image.
+.git
+.gitignore
+.github
+deploy
+docs
+data
+videos
+uploads
+*.md
+*.log
+*.json.bak
+h3gateway
+h3gateway.exe
+h3gateway.json
+.env
+.env.*
+!.env.example
+node_modules

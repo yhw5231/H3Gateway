@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>H3Gateway 后台管理</title>
+<meta name="robots" content="noindex,nofollow" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%235b8cff'/%3E%3Ctext x='16' y='22' font-family='Arial' font-size='14' font-weight='800' fill='%23fff' text-anchor='middle'%3EH3%3C/text%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/admin/admin.css" />
+</head>
+<body>
+
+<!-- ═══ login ═══ -->
+<div id="login" class="login-wrap hidden">
+  <form class="login-card" id="login-form">
+    <h1>H3Gateway 后台</h1>
+    <p class="sub">MiniMax-H3 图生视频网关 · 管理控制台</p>
+    <label class="field">
+      <span class="lb">用户名</span>
+      <input type="text" id="login-user" value="admin" autocomplete="username" required />
+    </label>
+    <label class="field">
+      <span class="lb">密码</span>
+      <input type="password" id="login-pass" autocomplete="current-password" required />
+    </label>
+    <button class="btn primary" type="submit" style="width:100%">登录</button>
+    <div class="login-hint">首次部署默认账号 <b>admin / admin</b>，登录后请立即修改密码。</div>
+  </form>
+</div>
+
+<!-- ═══ app ═══ -->
+<div id="app" class="layout hidden">
+  <aside class="side">
+    <div class="brand">
+      <b>H3Gateway</b>
+      <small>MiniMax-H3 网关控制台</small>
+    </div>
+    <nav class="nav" id="nav">
+      <button data-page="dash" class="on"><span class="ico">◧</span>仪表盘</button>
+      <button data-page="tasks"><span class="ico">▤</span>任务记录</button>
+      <button data-page="keys"><span class="ico">⚿</span>API 密钥</button>
+      <button data-page="settings"><span class="ico">⚙</span>运行设置</button>
+      <button data-page="xff"><span class="ico">⌘</span>XFF / IPv6 测试</button>
+      <button data-page="account"><span class="ico">☺</span>账号安全</button>
+    </nav>
+    <div class="side-foot">
+      <div class="who">已登录：<b id="who">-</b></div>
+      <a href="/" target="_blank" rel="noopener">打开创作台 ↗</a>
+      <div style="margin-top:8px"><button class="btn sm" id="logout" style="width:100%">退出登录</button></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div id="banners"></div>
+
+    <!-- ═══ 仪表盘 ═══ -->
+    <section id="page-dash" class="page">
+      <div class="page-head">
+        <div>
+          <h2>仪表盘</h2>
+          <div class="desc">上游通道、伪造身份轮换与任务概览</div>
+        </div>
+        <div class="row">
+          <button class="btn" id="dash-refresh">刷新</button>
+          <button class="btn" id="dash-upstream">测试上游连通性</button>
+          <button class="btn" id="dash-rotator-reset" title="清空已铸造身份的地址池并让统计归零（不影响已提交的任务）">重置身份统计</button>
+        </div>
+      </div>
+      <div class="grid cols-4" id="dash-stats"></div>
+      <div class="grid cols-2 mt">
+        <div class="card">
+          <h3>XFF 伪造状态</h3>
+          <dl class="kv" id="dash-xff"></dl>
+        </div>
+        <div class="card">
+          <h3>上游连通性 <span class="hint" id="upstream-hint"></span></h3>
+          <div id="upstream-body" class="muted small">点击「测试上游连通性」发起一次只读探测。</div>
+        </div>
+      </div>
+      <div class="card mt">
+        <h3>最近任务</h3>
+        <div class="tbl-wrap"><table>
+          <thead><tr><th>任务 ID</th><th>状态</th><th>模型</th><th>伪造 IP</th><th>创建时间</th></tr></thead>
+          <tbody id="dash-recent"></tbody>
+        </table></div>
+      </div>
+    </section>
+
+    <!-- ═══ 任务 ═══ -->
+    <section id="page-tasks" class="page hidden">
+      <div class="page-head">
+        <div>
+          <h2>任务记录</h2>
+          <div class="desc">所有生成任务及其上游状态</div>
+        </div>
+        <div class="row">
+          <select id="task-status" style="width:auto">
+            <option value="all">全部状态</option>
+            <option value="queued">排队中</option>
+            <option value="running">生成中</option>
+            <option value="succeeded">已完成</option>
+            <option value="failed">失败</option>
+          </select>
+          <input type="text" id="task-q" placeholder="搜索 ID / IP / 提示词…" style="width:230px" />
+          <button class="btn" id="task-refresh">查询</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="tbl-wrap"><table>
+          <thead><tr>
+            <th>任务 ID</th><th>状态</th><th>时长</th><th>伪造 IP</th>
+            <th>重投</th><th>密钥</th><th>创建时间</th><th></th>
+          </tr></thead>
+          <tbody id="task-rows"></tbody>
+        </table></div>
+        <div class="row mt">
+          <span class="muted small" id="task-count"></span>
+          <span class="spacer"></span>
+          <button class="btn sm" id="task-prev">上一页</button>
+          <button class="btn sm" id="task-next">下一页</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ API 密钥 ═══ -->
+    <section id="page-keys" class="page hidden">
+      <div class="page-head">
+        <div>
+          <h2>API 密钥</h2>
+          <div class="desc">用于 <span class="code-inline">Authorization: Bearer &lt;key&gt;</span> 访问 <span class="code-inline">/v1/*</span></div>
+        </div>
+        <div class="row">
+          <button class="btn primary" id="key-new">新建密钥</button>
+        </div>
+      </div>
+      <div id="keys-access"></div>
+      <div class="card">
+        <div class="tbl-wrap"><table>
+          <thead><tr>
+            <th>名称</th><th>密钥</th><th>状态</th><th>调用次数</th>
+            <th>最近使用</th><th>限速</th><th>创建时间</th><th></th>
+          </tr></thead>
+          <tbody id="key-rows"></tbody>
+        </table></div>
+      </div>
+    </section>
+
+    <!-- ═══ 设置 ═══ -->
+    <section id="page-settings" class="page hidden">
+      <div class="page-head">
+        <div>
+          <h2>运行设置</h2>
+          <div class="desc">修改后立即生效并持久化到数据文件；环境变量只作为首次启动的默认值</div>
+        </div>
+        <div class="row">
+          <button class="btn" id="set-reload">重新载入</button>
+          <button class="btn primary" id="set-save">保存设置</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>XFF 伪造 <span class="hint">上游按 X-Forwarded-For 的第一个值计次，每个值每天 2 次</span></h3>
+        <div id="set-xff-warn"></div>
+        <label class="field">
+          <span class="lb">伪造模式</span>
+          <select id="set-xff-mode">
+            <option value="auto">自动（按测试结果选择，推荐）</option>
+            <option value="ipv4">随机公网 IPv4</option>
+            <option value="ipv6" data-needs-ipv6="1">随机公网 IPv6</option>
+            <option value="mixed">混合（IPv4 + IPv6 随机）</option>
+            <option value="off">关闭（使用真实出口 IP，配合代理池时使用）</option>
+          </select>
+          <div class="help" id="set-xff-mode-help"></div>
+        </label>
+        <label class="field">
+          <span class="lb">地址池</span>
+          <select id="set-xff-pool">
+            <option value="public">公网地址（与 Python 原版一致）</option>
+            <option value="reserved">保留/文档地址段（不占用真实用户配额）</option>
+          </select>
+          <div class="help">保留地址段使用 RFC 5737（IPv4）与 RFC 3849（IPv6），已实测同样被上游接受。</div>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="set-xff-variants" />
+          <span>使用 IPv6 文本变体
+            <small>上游按原始字符串计次、不做规范化，同一地址的压缩/展开、大小写形式会落在不同配额桶。</small>
+          </span>
+        </label>
+      </div>
+
+      <div class="card">
+        <h3>上游通道</h3>
+        <div class="grid cols-2">
+          <label class="field">
+            <span class="lb">上游地址</span>
+            <input type="text" id="set-upstream" placeholder="https://siftq.com" />
+          </label>
+          <label class="field">
+            <span class="lb">接口前缀</span>
+            <input type="text" id="set-trial-base" placeholder="/api/minimax-trial" />
+          </label>
+        </div>
+        <label class="field">
+          <span class="lb">生成通道</span>
+          <select id="set-endpoint-mode">
+            <option value="plain">plain · /video-generation（匿名可用，实测可用）</option>
+            <option value="showcase">showcase · /showcase/video-generation（当前需要登录）</option>
+          </select>
+          <div class="help">上游试用页当前走 plain 通道；showcase 通道会返回 <span class="code-inline">login_required</span>，仅在重新开放时选用。</div>
+        </label>
+        <label class="field">
+          <span class="lb">showcase_id（仅 showcase 通道使用）</span>
+          <input type="text" id="set-showcase" />
+        </label>
+        <label class="field">
+          <span class="lb">默认提示词 <span class="muted small">（plain 通道上游会忽略 prompt）</span></span>
+          <textarea id="set-prompt" rows="3"></textarea>
+        </label>
+      </div>
+
+      <div class="card">
+        <h3>并发与重试</h3>
+        <div class="grid cols-3">
+          <label class="field">
+            <span class="lb">最大并发</span>
+            <input type="number" id="set-max-conc" min="1" max="64" />
+            <div class="help">上游硬上限 5，建议 4。</div>
+          </label>
+          <label class="field">
+            <span class="lb">提交总时限（秒）</span>
+            <input type="number" id="set-submit-timeout" min="5" />
+            <div class="help">配额耗尽即换身份，超时兜底。</div>
+          </label>
+          <label class="field">
+            <span class="lb">轮询间隔（秒）</span>
+            <input type="number" id="set-poll-interval" min="0.5" step="0.5" />
+          </label>
+          <label class="field">
+            <span class="lb">失败自动重投次数</span>
+            <input type="number" id="set-resubmits" min="0" max="100" />
+          </label>
+          <label class="field">
+            <span class="lb">重投基础退避（秒）</span>
+            <input type="number" id="set-resubmit-backoff" min="1" max="900" />
+          </label>
+          <label class="field">
+            <span class="lb">图片大小上限（字节）</span>
+            <input type="number" id="set-image-max" min="65536" />
+          </label>
+          <label class="field">
+            <span class="lb">任务保留条数</span>
+            <input type="number" id="set-retention" min="50" />
+          </label>
+        </div>
+        <label class="field">
+          <span class="lb">代理池 <span class="muted small">（逗号分隔，支持 http:// 与 socks5://）</span></span>
+          <input type="text" id="set-proxy" placeholder="socks5://127.0.0.1:1080, http://user:pass@host:8080" />
+          <div class="help">配置代理后不再伪造 XFF —— 此时真实出口 IP 就是配额键。</div>
+        </label>
+      </div>
+
+      <div class="card">
+        <h3>访问控制</h3>
+        <label class="check">
+          <input type="checkbox" id="set-require-key" />
+          <span>强制要求 API 密钥
+            <small>开启后 <span class="code-inline">/v1/*</span> 只接受合法密钥；创作台的内置会话也会被拒绝。</small>
+          </span>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="set-studio-session" />
+          <span>允许创作台免密调用
+            <small>访问 <span class="code-inline">/</span> 时下发会话 Cookie，使内置前端可直接调用 <span class="code-inline">/v1/*</span>。</small>
+          </span>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="set-trust-proxy" />
+          <span>信任反向代理头
+            <small>开启后使用 X-Forwarded-For / X-Forwarded-Proto 还原客户端地址与协议；仅在网关前面确有可信代理时开启。</small>
+          </span>
+        </label>
+        <label class="field">
+          <span class="lb">对外基础地址 <span class="muted small">（可选）</span></span>
+          <input type="text" id="set-public-url" placeholder="https://h3.example.com" />
+          <div class="help">用于拼接返回给客户端的 video_url；留空则按请求头推断。</div>
+        </label>
+      </div>
+    </section>
+
+    <!-- ═══ XFF / IPv6 ═══ -->
+    <section id="page-xff" class="page hidden">
+      <div class="page-head">
+        <div>
+          <h2>XFF / IPv6 能力测试</h2>
+          <div class="desc">实测上游是否把伪造的 X-Forwarded-For（IPv4 / IPv6）当作独立配额键</div>
+        </div>
+        <div class="row">
+          <button class="btn" id="probe-dry">仅连通性检查</button>
+          <button class="btn primary" id="probe-run">运行完整测试</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>测试原理</h3>
+        <ol class="small muted" style="margin:0;padding-left:20px;line-height:1.9">
+          <li>分别选取一个随机 IPv4 与随机 IPv6 地址，读取 <span class="code-inline">GET /usage</span>，两者初始应为 <span class="code-inline">remaining=2</span>。</li>
+          <li>用该地址作为 <span class="code-inline">X-Forwarded-For</span> 提交一次真实生成。</li>
+          <li>再次读取同一地址的 <span class="code-inline">/usage</span>：若 <span class="code-inline">remaining</span> 由 2 变为 1，说明上游确实以该伪造地址作为配额键。</li>
+          <li>IPv4 与 IPv6 各自独立验证，互不掩盖。</li>
+        </ol>
+        <div class="help">完整测试每个地址族会消耗 1 次上游免费额度（这是唯一能证明配额键归属的方式）；连通性检查不消耗额度。</div>
+      </div>
+
+      <div id="probe-result"></div>
+    </section>
+
+    <!-- ═══ 账号 ═══ -->
+    <section id="page-account" class="page hidden">
+      <div class="page-head">
+        <div>
+          <h2>账号安全</h2>
+          <div class="desc">后台登录密码</div>
+        </div>
+      </div>
+      <div class="card" style="max-width:460px">
+        <h3>修改密码</h3>
+        <form id="pw-form">
+          <label class="field">
+            <span class="lb">当前密码</span>
+            <input type="password" id="pw-current" autocomplete="current-password" required />
+          </label>
+          <label class="field">
+            <span class="lb">新密码 <span class="muted small">（至少 8 位）</span></span>
+            <input type="password" id="pw-new" autocomplete="new-password" minlength="8" required />
+          </label>
+          <label class="field">
+            <span class="lb">确认新密码</span>
+            <input type="password" id="pw-confirm" autocomplete="new-password" minlength="8" required />
+          </label>
+          <button class="btn primary" type="submit">更新密码</button>
+        </form>
+      </div>
+      <div class="card" style="max-width:460px">
+        <h3>运行信息</h3>
+        <dl class="kv" id="acct-info"></dl>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<div class="toast-host" id="toasts"></div>
+<div id="modal-host"></div>
+
+<script src="/admin/admin.js"></script>
+</body>
+</html>

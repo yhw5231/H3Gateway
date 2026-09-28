@@ -1,147 +1,578 @@
-# SiftQ MiniMax-H3 → OpenAI 兼容 API 网关
+# H3Gateway（Go 重写版）
 
-把 `https://siftq.com/minimax-h3/try` 的匿名试用通道（MiniMax H3 图生视频）封装成
-OpenAI 风格 API。基于对页面 JS bundle 的逆向 + 实测。
+把 MiniMax-H3 匿名试用通道包装成 **OpenAI 风格视频接口** 的网关。本项目是
+[HaizhuAI/HaizhuVideo-H3Gateway](https://github.com/HaizhuAI/HaizhuVideo-H3Gateway)
+（Python/FastAPI 实现）的 **Go 重写**：只依赖标准库，单文件二进制，面向容器部署。
 
-## 逆向结论（怎么绕限额）
+> 原 Python 实现（`gateway.py`）已从当前分支移除，仍可在 git 历史（提交 `ce06ebf`）
+> 与上游仓库中查看。各版本变更见 [更新说明](CHANGELOG.md)。
 
-试用接口 `/api/minimax-trial/*` 没有任何 cookie / 账号鉴权，全部信任客户端自产标识：
+---
 
-| 标识 | 来源 | 作用 |
-|---|---|---|
-| `X-MiniMax-Trial-Client` 头 + `client_id` 表单字段 | 前端 `mmtrial_<uuid>`，localStorage `minimax-h3-trial-client-id-v1` | 任务归属 |
-| `visitorId` 表单字段 | 前端 `mmguest_<uuid>`，localStorage `minimax-h3-telemetry-guest-visitor-id-v2` | 遥测 |
-| `X-Forwarded-For` 头 | 浏览器不带，由前端/代理写入 | **服务端限流键** |
+## 目录
 
-服务端限额逻辑（实测）：
+- [特性](#特性)
+- [快速开始](#快速开始)
+- [容器网络说明（重要）](#容器网络说明重要)
+- [后台管理](#后台管理)
+- [随机公网 XFF 与 IPv6 支持](#随机公网-xff-与-ipv6-支持)
+- [API 文档](#api-文档)
+- [配置项](#配置项)
+- [目录结构](#目录结构)
+- [常见问题](#常见问题)
+- [与 Python 原版的差异](#与-python-原版的差异)
 
-- 匿名每日 2 次生成（`anonymous_daily_limit: 2`），按 **XFF 第一个值**计数；
-- 超出返回 `429 rate_limit_error`；
-- 换 `mmtrial_` client id **无效**（实测仍 429，usage 显示 used:2）；
-- 换 UA **无效**；
-- **伪造 XFF 立即重置配额**（实测 4/4 成功，`remaining` 回 1）；
-- 浏览器 cookie 与试用通道完全无关（接口无 Set-Cookie，`credentials:"include"` 只是摆设）。
+---
 
-### 生成端点（重要）
+## 特性
 
-上游有两条生成通道，行为完全不同：
+| 能力 | 说明 |
+| --- | --- |
+| OpenAI 风格接口 | `POST /v1/videos`、`GET /v1/videos/{id}`、`GET /v1/videos/{id}/content`，另有 `POST /v1/chat/completions` |
+| 随机公网 XFF | 每个请求伪造一个随机 `X-Forwarded-For`，上游按该值独立计配额，**IPv4 与 IPv6 均已实测可用** |
+| 后台管理台 | 深色主题单页控制台：仪表盘、任务、密钥、设置、IPv6 实测、账号安全 |
+| API 密钥管理 | 新建/启停/删除/限速/有效期，明文只在创建时返回一次 |
+| 持久化 | 单文件 JSON 数据库（原子写入），任务、密钥、设置、实测结论全部落盘 |
+| 容器友好 | 多阶段构建，非 root 运行，单一数据卷，**只使用默认 bridge 网络** |
+| 零第三方依赖 | 纯 Go 标准库，PBKDF2、SOCKS5、会话签名均为自实现，可完全离线构建 |
+| 健壮性 | 上游失败自动重投、身份轮换、并发闸门、视频本地缓存、重启续跑 |
 
-| 端点 | prompt | 画幅 | 说明 |
-|---|---|---|---|
-| `/api/minimax-trial/video-generation` | **忽略** | 任意 | 无 showcase 时的试用口；服务端固定套用 showcase 编排 prompt（一律产出「跳舞」类内容） |
-| `/api/minimax-trial/showcase/video-generation` | **生效** | **仅 9:16** | showcase 驱动口；`showcase_id` 必填但显式 `prompt` 会覆盖其编排；匿名可用 |
+---
 
-本网关一律走 showcase 通道：`prompt` 真实控制出片，`showcase_id` 用
-`GATEWAY_SHOWCASE_ID`（默认 `case-mtqzygu8`）兜底；`prompt` 为空时注入
-`GATEWAY_DEFAULT_PROMPT`（中性自然动作），避免回退到 showcase 的固定编排。
+## 快速开始
 
-因此 **`size` 仅支持 9:16**，其他画幅返回 400。这是上游硬限制（官方前端
-`sRe` 同样写死 `"9:16"`），不是网关限制。
-
-另外两条路（未采用）：`/api/minimax-experience/admin/accounts` + `X-MiniMax-Admin-Key`
-可铸 2000 积分体验账户，但 key 只在站方手里；登录走 Google Firebase idToken，
-账号农场成本高。
-
-## 运行
+### 方式一：Docker Compose（推荐）
 
 ```bash
-pip install -r requirements.txt
-python gateway.py            # 默认 127.0.0.1:8787
+cp .env.example .env      # 按需修改；不改也能直接跑
+docker compose up -d
 ```
 
-### Linux 部署
+打开 <http://127.0.0.1:8787/admin>，用 **admin / admin** 登录。
+
+> 首次登录后控制台会被锁定，必须先修改密码才能使用其它功能（见
+> [后台管理](#后台管理)）。
+
+常用命令：
 
 ```bash
-unzip h3-studio-gateway.zip && cd h3-studio-gateway
-./start.sh                   # 自动建 .venv 并启动
-
-# 或 systemd 常驻（先手动 pip install -r requirements.txt 到 .venv）
-sudo cp -r . /opt/h3-studio-gateway && cd /opt/h3-studio-gateway
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-sudo cp h3-gateway.service /etc/systemd/system/
-sudo systemctl enable --now h3-gateway
-journalctl -u h3-gateway -f  # 看日志
+docker compose logs -f          # 查看日志
+docker compose restart          # 重启
+docker compose down             # 停止（数据卷保留）
+docker compose down -v          # 停止并删除数据卷（清空全部状态）
 ```
 
-对外暴露时：网关监听保持 `127.0.0.1`，前面套 nginx/Caddy 反代 + TLS，并设置
-`GATEWAY_API_KEY`（所有 `/v1/*` 需 `Authorization: Bearer <key>`）。出站需能访问
-`siftq.com`，国内机器通常要配 `PROXY_LIST`。
-
-环境变量：
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `GATEWAY_HOST` / `GATEWAY_PORT` | `127.0.0.1` / `8787` | 监听地址 |
-| `GATEWAY_API_KEY` | 空 | 设置后所有 `/v1/*` 需要 `Authorization: Bearer <key>` |
-| `GATEWAY_MAX_CONCURRENT` | `4` | 上游并发上限 5，留 1 余量 |
-| `GATEWAY_SUBMIT_TIMEOUT` | `900` | 提交重试总时限（秒）；配额按伪造 IP 计且身份无限铸造，429 即换新身份直到成功，超时兜底 |
-| `PROXY_LIST` | 空 | 逗号分隔的 http/socks5 代理；设置后走真实代理 IP，不再伪造 XFF |
-| `GATEWAY_DB` | `./gateway.db` | SQLite 任务库 |
-| `GATEWAY_VIDEOS_DIR` | `./videos` | 成片本地缓存目录；出片即落盘（上游约 1-2 天回收任务），`/content` 优先发本地 |
-| `GATEWAY_UPLOADS_DIR` | `./uploads` | 输入图暂存；上游执行失败时自动换新身份重投（`GATEWAY_TASK_RESUBMITS` 次，默认 8，间隔递增） |
-| `GATEWAY_SHOWCASE_ID` | `case-mtqzygu8` | showcase 通道的引用素材 id（`prompt` 会覆盖其编排） |
-| `GATEWAY_DEFAULT_PROMPT` | 中性自然动作 | 调用方不传 `prompt` 时的兜底文案 |
-
-## 用法
-
-### Sora 风格视频接口
+### 方式二：docker run
 
 ```bash
-# JSON（image_url 或 base64 data URL）
+docker build -t h3gateway:latest .
+
+docker run -d --name h3gateway \
+  --network bridge \
+  -p 8787:8787 \
+  -e GATEWAY_ADMIN_PASSWORD=admin \
+  -v h3gateway-data:/data \
+  --restart unless-stopped \
+  h3gateway:latest
+```
+
+### 方式三：本地二进制
+
+```bash
+go build -o h3gateway .
+./h3gateway serve                       # 默认 127.0.0.1:8787
+./h3gateway serve -host 0.0.0.0 -port 9000
+```
+
+### 方式四：systemd（Linux 非容器部署）
+
+仓库提供加固过的单元文件 [`deploy/h3gateway.service`](deploy/h3gateway.service)：
+
+```bash
+sudo useradd --system --home /var/lib/h3gateway --shell /usr/sbin/nologin h3gateway
+sudo install -m 0755 h3gateway /usr/local/bin/h3gateway
+sudo install -d -o h3gateway -g h3gateway -m 0750 /var/lib/h3gateway
+sudo install -d -m 0755 /etc/h3gateway
+sudo install -m 0640 -o root -g h3gateway .env.example /etc/h3gateway/h3gateway.env
+sudo install -m 0644 deploy/h3gateway.service /etc/systemd/system/h3gateway.service
+sudo systemctl daemon-reload && sudo systemctl enable --now h3gateway
+```
+
+该单元默认只监听 `127.0.0.1`（要对外提供服务请在
+`/etc/h3gateway/h3gateway.env` 里设 `GATEWAY_HOST=0.0.0.0`，并确认前面有反向代理
+或防火墙），并启用 `ProtectSystem=strict`、`NoNewPrivileges`、`MemoryDenyWriteExecute`
+等加固项，唯一可写路径是 `/var/lib/h3gateway`。
+
+### 自检
+
+```bash
+./h3gateway version                     # 版本
+./h3gateway probe                       # 直连上游，实测 IPv4/IPv6 配额键（消耗额度）
+./h3gateway probe -dry-run              # 仅检查连通性，不消耗额度
+./h3gateway help                        # 用法
+```
+
+`probe` 会把结论写入数据文件，后台的「自动」模式会据此选择 IPv4 / IPv6 / 混合。
+
+### 部署注意事项
+
+| 事项 | 说明 |
+| --- | --- |
+| **数据卷权限** | 容器以非 root 的 uid/gid `10001` 运行。使用**命名卷**时 Docker 会自动沿用镜像里 `/data` 的属主，无需干预；改用**绑定挂载**（`-v /host/data:/data`）时，宿主机目录必须先 `chown 10001:10001`，否则启动后无法写入任务与视频 |
+| **端口** | 容器内固定监听 `8787`，`docker-compose.yml` 的 `environment:` 里已硬编码 `GATEWAY_PORT=8787`，且镜像的 `HEALTHCHECK` 也探测该端口。改对外端口请只改 `H3_PORT`（compose）或 `-p`（docker run），不要改容器内的端口 |
+| **反向代理** | 在 nginx/Caddy 后面时建议设置 `GATEWAY_PUBLIC_URL`，让返回的下载链接指向对外地址；同时设 `GATEWAY_TRUST_PROXY=true`，使控制台记录的客户端 IP 取自 `X-Forwarded-For` |
+| **升级** | 重新构建镜像并 `docker compose up -d`（或替换二进制后 `systemctl restart h3gateway`）。数据全部在数据卷/数据目录，升级不丢任务、密钥与设置 |
+| **时区** | compose 默认 `TZ=Asia/Shanghai`，需要别的时区改这个变量 |
+| **离线构建** | 无第三方依赖，`docker build` 不需要联网拉包；构建镜像 `golang:1.23-alpine` 与 `alpine:latest` 需事先存在或可拉取 |
+| **架构** | 交叉构建请用 `docker buildx build --platform linux/arm64 ...`（BuildKit 会据此设置 `TARGETARCH`）。直接 `--build-arg TARGETARCH=arm64` 只会把 arm64 二进制塞进 amd64 镜像，无法运行 |
+
+---
+
+## 容器网络说明（重要）
+
+**本项目只使用 Docker 默认 bridge 网络，不会创建任何项目网络。**
+
+具体做法：`docker-compose.yml` 里的服务声明了 `network_mode: bridge`，并且
+**整个文件没有任何 `networks:` 段落**。因此 `docker compose up` 不会创建
+`h3gateway_default` 之类的网络。
+
+验证方法：
+
+```bash
+docker network ls                       # 记录当前网络列表
+docker compose up -d
+docker network ls                       # 列表应与之前完全一致
+docker inspect h3gateway --format '{{.HostConfig.NetworkMode}}'   # 输出 bridge
+```
+
+实测结果（本机验证记录）：
+
+```
+启动前: bridge host ipv6-net localcline_default none novelgenerationgo_default ...
+启动后: bridge host ipv6-net localcline_default none novelgenerationgo_default ...   ← 完全一致
+容器网络模式: bridge
+```
+
+如果你确实需要和其它容器互通，有两种不创建项目网络的做法：
+
+1. 让对端容器也加入默认 bridge：`docker run --network bridge ...`
+2. 用 `network_mode: "container:<对端容器名>"` 共享网络栈
+
+> 在 **Docker Desktop for Windows/macOS** 上，容器**无法**通过 `172.17.0.1`
+> 访问宿主机上监听 `0.0.0.0` 的服务（容器跑在虚拟机里）。如果上游需要经代理访问，
+> 请把代理地址写成 `host.docker.internal:<端口>`（Docker Desktop 提供该名称解析），
+> 或改用 `network_mode: "container:<代理容器名>"`。
+
+---
+
+## 后台管理
+
+地址：<http://127.0.0.1:8787/admin>　默认账号：**admin / admin**
+
+### 首次登录必须改密
+
+用默认密码登录后，服务端会拒绝除「修改密码」和「会话查询」以外的所有后台接口
+（返回 `403`），控制台顶部同时显示红色提示。改密成功后会自动换发新的会话
+Cookie，无需重新登录。
+
+播种逻辑：只有当数据文件里还不存在该账号时，才用 `GATEWAY_ADMIN_USER` /
+`GATEWAY_ADMIN_PASSWORD` 创建；`MustChangePassword` 仅在密码等于 `admin` 时置位。
+也就是说**改过密码之后，环境变量里的默认值不会再把它改回来**。
+
+### 六个页面
+
+| 页面 | 功能 |
+| --- | --- |
+| **仪表盘** | 任务总数/成功/进行中/失败、密钥数、身份轮换统计、在飞请求；上游连通性一键探测；最近任务；XFF 当前配置与实测状态 |
+| **任务** | 按状态筛选 + 关键词搜索 + 分页；查看详情（含伪造 XFF、上游任务号、access_token、缓存情况）、在线播放/下载 MP4、重投、删除 |
+| **API 密钥** | 新建（名称/备注/有效期/限速）、启用停用、删除。**完整密钥只在创建时显示一次**，列表里只保留前缀 |
+| **运行设置** | 上游地址、接口通道、默认提示词、XFF 模式与地址池、文本变体、并发、超时、轮询间隔、重投次数与退避、图片体积上限、保留条数、代理列表、访问控制 |
+| **XFF / IPv6 测试** | 一键实测「上游是否把 X-Forwarded-For 当作独立配额键」，并分别给出 IPv4 / IPv6 结论；通过后可直接一键切换到 IPv6 或混合模式 |
+| **账号安全** | 修改密码；查看监听地址、数据目录与数据文件路径 |
+
+### 访问控制规则
+
+`/v1/*` 的鉴权顺序：
+
+1. 请求头里带了有效的 `Authorization: Bearer <API 密钥>` → 通过
+2. 带了工作台 Cookie（`GATEWAY_STUDIO_SESSION=true` 时）→ 通过
+3. 带了后台 Cookie → 通过
+4. 以上都没有，且**存在已启用的密钥**或开启了 `GATEWAY_REQUIRE_API_KEY` → `401`
+5. 以上都没有，且没有任何启用的密钥、也没开启强制校验 → 放行（**默认开放**）
+
+> ⚠️ 默认是开放的：只要能访问端口就能调用。生产环境请在后台新建密钥并在
+> 「运行设置 → 访问控制」中开启强制校验。服务启动时若检测到开放状态，日志里会有
+> `WARN` 提示。
+
+**显式提供了错误的密钥永远返回 401**，不会退回匿名放行。
+
+### 安全细节
+
+- 密码使用 PBKDF2-HMAC-SHA256，210000 次迭代，32 字节随机盐，十六进制存储
+- 会话 Cookie 是 HMAC-SHA256 签名的无状态令牌；`h3_admin` 有效期 12 小时，
+  `h3_studio` 30 天；两者均为 `HttpOnly` + `SameSite=Lax`
+- 所有会改变状态的后台请求都必须携带 `X-Requested-With` 头并同源，用于阻断 CSRF
+- 任务列表、密钥列表都不返回密钥明文；日志不打印密钥与 access_token
+
+---
+
+## 随机公网 XFF 与 IPv6 支持
+
+### 原理
+
+上游的匿名试用额度**不是按真实来源 IP 计的**，而是按请求头 `X-Forwarded-For`
+的**第一个值的原始字符串**计：
+
+- 每个不同的字符串值，每天 2 次生成
+- 比较时**不做任何 IP 规范化**：展开写法与压缩写法算两个桶，
+  大小写不同算两个桶，`[2001:db8::1]` 带方括号也算另一个桶
+- 私网/保留地址同样被接受，没有任何校验
+
+所以只要每次请求换一个随机地址，额度就近乎无限。
+
+### IPv6 实测结论
+
+**上游完全支持 IPv6 形式的 XFF，与 IPv4 等价。** 这不是推测，而是用
+「对照键」方法实测出来的。
+
+测试方法（后台「XFF / IPv6 测试」页或 `h3gateway probe` 执行）：
+
+1. 读一次目标地址的 `/usage`，记录基线 `remaining`
+2. 用该地址提交一次真实生成
+3. 再读一次该地址的 `/usage`，确认 `remaining` 减少
+4. **同时读一个同族但全新未使用的「对照地址」**，确认它的 `remaining` 仍是满额
+
+第 4 步是关键：如果上游忽略了请求头、退回按真实出口 IP 计数，那么对照地址会落到
+同一个桶里、同样被扣减。只有「目标地址被扣减 + 对照地址未被动过」才能证明配额确实
+由请求头决定。只用「前后对比」的方法会产生假阳性。
+
+本机对线上上游的实测输出：
+
+```
+GET https://siftq.com/api/minimax-trial/usage 可达
+IPv4 键 198.51.100.153 初始 remaining=2
+IPv6 键 2001:db8:d671:abe8:11d3:b296:25a7:dfb2 初始 remaining=2
+IPV4 提交成功（键 198.51.100.153），重新读取配额…
+IPV4 提交后 remaining 2 -> 1
+IPV4 对照键 203.0.113.33 remaining=2/2（未被扣减，说明配额按 XFF 计）
+IPV4 结论：✅ 上游以 X-Forwarded-For 作为独立配额键
+IPV6 提交成功（键 2001:db8:d671:abe8:11d3:b296:25a7:dfb2），重新读取配额…
+IPV6 提交后 remaining 2 -> 1
+IPV6 对照键 2001:db8:252d:f441:bb8f:9202:7400:4efc remaining=2/2（未被扣减，说明配额按 XFF 计）
+IPV6 结论：✅ 上游以 X-Forwarded-For 作为独立配额键
+```
+
+后台的 IPv6 选项（「运行设置 → XFF 模式 → 随机公网 IPv6」）只有在实测通过后才会
+被推荐启用；`auto` 模式也会依据实测结论自动升级为 `mixed`。
+
+### 五种模式
+
+| 模式 | 行为 |
+| --- | --- |
+| `off` | 不伪造，所有请求共用同一个配额桶 |
+| `ipv4` | 每次使用随机公网 IPv4 |
+| `ipv6` | 每次使用随机公网 IPv6 |
+| `mixed` | 随机混合使用 IPv4 / IPv6 |
+| `auto` | 按后台实测结论自动选择；**未测试时安全退化为 `ipv4`** |
+
+安全设计：如果配置了 `ipv6` 但实测并未确认 IPv6 可用，网关会自动**降级**为 `ipv4`
+而不是盲目伪造，避免整条链路失败。
+
+### 地址池
+
+| 池 | 说明 |
+| --- | --- |
+| `public`（默认） | 真实公网地址段，额度最大化，与原 Python 版行为一致 |
+| `reserved` | RFC 5737（`198.51.100.0/24` 等）与 RFC 3849（`2001:db8::/32`）文档地址段。这些段不会指向任何真实主机，若伪造的地址被第三方日志采集或反向探测，不会牵连无关的真实站点，**更安全但会与其它使用者共享同一个文档段配额桶** |
+
+### 文本变体
+
+`xff_variants` 开启后，会在同一地址的多种写法（压缩 / 展开 / 大写）之间随机选择。
+由于上游按原始字符串计数，这等于把每个地址变成多个配额桶。
+
+默认**关闭**：随机 IPv6 本身已经提供约 2^64 量级的地址空间，再叠加变体没有实际
+收益，只会让日志更难读。
+
+### 代理与伪造互斥
+
+一旦配置了 `PROXY_LIST`，网关**不再伪造** `X-Forwarded-For`（真实出口地址由代理
+决定），配额将按代理出口 IP 计算。这是有意为之：伪造的头会被代理覆盖，留着只会
+造成误解。
+
+同理，「XFF / IPv6 测试」**始终直连上游**（不使用代理），否则测不出任何东西。
+测试步骤里会明确提示这一点。
+
+> 注意：代理地址不可达时，提交会持续重试直到 `submit_timeout_sec` 超时。配置代理
+> 后请先用仪表盘的「探测上游」确认可用。
+
+---
+
+## API 文档
+
+所有 `/v1/*` 接口都遵循 OpenAI 风格：鉴权用 `Authorization: Bearer <API 密钥>`，
+错误体为 `{"error": {"message": ..., "type": ..., "code": ...}}`。
+
+### 创建视频
+
+`POST /v1/videos`
+
+支持两种提交方式。
+
+**JSON + data URL / 图片链接：**
+
+```bash
 curl -X POST http://127.0.0.1:8787/v1/videos \
-  -H "Content-Type: application/json" \
-  -d '{"model":"minimax-h3","image_url":"https://example.com/ref.jpg","seconds":"6","size":"9:16"}'
-# => 202 {"id":"video_...","status":"queued",...}
-
-# 或 multipart 直传文件
-curl -X POST http://127.0.0.1:8787/v1/videos -F "image=@ref.jpg" -F "seconds=10"
-
-# 轮询 / 下载
-curl http://127.0.0.1:8787/v1/videos/video_xxx
-curl -O http://127.0.0.1:8787/v1/videos/video_xxx/content
-```
-
-`size` **仅支持 `9:16`**（上游 showcase 通道硬限制），其他值返回 400。
-`seconds` 支持 6 / 10 / 15（4–7→6，8–12→10，13–20→15）。模型 `minimax-h3-10s` /
-`minimax-h3-15s` 直接锁定对应时长。`prompt` 字段真实控制出片内容（已实测：
-图+「the player scores a try」产出对应动作，不再是固定跳舞片）。
-
-### Chat Completions 垫片
-
-给只会说 chat completions 的客户端用：最后一条 user message 里带图片
-（`image_url` part，支持 http(s) / base64 data URL），返回视频下载链接。
-
-```bash
-curl -X POST http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer h3-xxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
-    "model":"minimax-h3",
-    "messages":[{"role":"user","content":[
-      {"type":"text","text":"make it move"},
-      {"type":"image_url","image_url":{"url":"https://example.com/ref.jpg"}}
-    ]}],
-    "video":{"seconds":"6","size":"9:16"},
-    "wait_seconds":180
-  }'
+        "model": "minimax-h3",
+        "image": "data:image/jpeg;base64,<BASE64>",
+        "prompt": "镜头缓慢推进，人物轻微眨眼",
+        "duration": 6
+      }'
 ```
 
-- 默认异步：立刻返回 task id + 下载链接，自己轮询 `/v1/videos/{id}`；
-- `wait_seconds: N` 阻塞等到出片（或超时）；
-- `stream: true` 走 SSE。
+**multipart 上传：**
 
-注意：出片为 9:16 竖屏（上游 showcase 通道限制）；`prompt` 生效。
+```bash
+curl -X POST http://127.0.0.1:8787/v1/videos \
+  -H "Authorization: Bearer h3-xxxxxxxx" \
+  -F "image=@photo.jpg;type=image/jpeg" \
+  -F "prompt=镜头缓慢推进" \
+  -F "duration=10"
+```
 
-### 其他
+参数：
 
-- `GET /v1/models` — 模型列表（`minimax-h3` / `minimax-h3-10s` / `minimax-h3-15s`）
-- `GET /v1/trial/usage` — 轮换器状态（已铸身份数、耗尽数、代理模式）
-- `GET /health`
-- `GET /` — H3 片场前端（手绘拼贴风，内置于 `web/`）
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `image` | ✅ | 图片本体（multipart 的 `image` 字段），或 JSON 里的 `data:image/...;base64,...` / `http(s)` 链接 |
+| `model` | | 默认 `minimax-h3`。模型名以 `-10s` / `-15s` 结尾可指定时长 |
+| `prompt` | | 提示词。会转发给上游，但**该通道的上游前端本身不发送 prompt，是否生效未经证实** |
+| `duration` / `seconds` | | 4-7 → 6 秒，8-12 → 10 秒，13-20 → 15 秒；默认 6 秒 |
+| `ratio` / `size` | | 仅支持竖屏 9:16（上游硬限制）。接受 `9:16`、`720x1280`、`1080x1920`、`vertical`、`portrait` |
 
-## 轮换引擎
+返回 `202 Accepted`：
 
-每次提交：铸造新 `mmtrial_<uuid>` + `mmguest_<uuid>` + 随机公网 XFF，每个假 IP 理论
-2 次/天；429 即烧毁当前身份并铸新身份重试（时限 `GATEWAY_SUBMIT_TIMEOUT`，默认
-900s，近似无限）；提交受 `MAX_CONCURRENT` 信号量控制；
-后台 poller 每 3s 轮询上游直到终态，结果进 SQLite。任务查询/下载只用提交时保存的
-`access_token` + `client_id` + XFF（实测 query 闸门是 access_token）。
+```json
+{
+  "id": "video_8e59f8f949f80449",
+  "object": "video",
+  "model": "minimax-h3",
+  "status": "queued",
+  "progress": 10,
+  "created": 1790567763,
+  "completed_at": null,
+  "ratio": "9:16",
+  "size": "9:16",
+  "seconds": "6",
+  "failure_reason": null,
+  "attempts": 0,
+  "created_at": "2026-09-28T03:56:03Z",
+  "updated_at": "2026-09-28T03:56:03Z"
+}
+```
+
+### 查询任务
+
+`GET /v1/videos/{id}`
+
+`status` 取值：`queued` → `running` → `succeeded` / `failed` / `canceled`，
+`progress` 依次为 10 / 50 / 100。成功后额外返回 `video_url` 与 `url`。
+
+### 下载视频
+
+`GET /v1/videos/{id}/content`
+
+返回 `video/mp4`。文件在生成成功后立即缓存到本地（`<数据目录>/videos/<id>.mp4`），
+因此即使上游把任务回收了也仍可下载。
+
+### 试用量信息
+
+`GET /v1/trial/usage` —— 返回当前容量与生效模式（不含任何运维计数）：
+
+```json
+{
+  "enabled": true,
+  "in_flight": 0,
+  "max_concurrent": 4,
+  "pool_ready": 0,
+  "xff_mode": "auto",
+  "effective_xff_mode": "mixed",
+  "ipv6_supported": true,
+  "endpoint_mode": "plain"
+}
+```
+
+### 模型列表
+
+`GET /v1/models` —— OpenAI 风格的模型清单。
+
+### Chat Completions
+
+`POST /v1/chat/completions`
+
+兼容把图片放在 `messages[].content[].image_url` 里的调用方式（`image_url` 既支持
+`{"url": "..."}` 对象形式，也支持裸字符串），返回一条包含任务信息的 assistant
+消息；`"stream": true` 时返回 SSE 流。
+
+### 健康检查
+
+`GET /health`、`GET /healthz` —— 无需鉴权，返回 `{"status":"ok","time":"..."}`。
+
+### 其它入口
+
+| 路径 | 说明 |
+| --- | --- |
+| `/` | 网页工作台（原 Python 版的 `web/`，已改写资源路径） |
+| `/studio/*` | 工作台的静态资源 |
+| `/admin` | 后台管理控制台 |
+
+---
+
+## 配置项
+
+环境变量只决定**首次启动**（数据文件尚不存在）时的初始值；之后以数据文件里的设置
+为准，可在后台「运行设置」里随时修改。
+
+完整清单见 [`.env.example`](.env.example)。常用项：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `GATEWAY_HOST` | `127.0.0.1`（容器内为 `0.0.0.0`） | 监听地址 |
+| `GATEWAY_PORT` | `8787` | 监听端口 |
+| `GATEWAY_DATA_DIR` | `./data`（容器内 `/data`） | 数据目录 |
+| `GATEWAY_ADMIN_USER` / `GATEWAY_ADMIN_PASSWORD` | `admin` / `admin` | 首次播种的后台账号 |
+| `GATEWAY_SESSION_SECRET` | 随机生成并落盘 | 会话签名密钥 |
+| `GATEWAY_API_KEY` | 空 | 首次启动时导入一个 API 密钥 |
+| `GATEWAY_UPSTREAM` | `https://siftq.com` | 上游地址 |
+| `GATEWAY_ENDPOINT_MODE` | `plain` | `plain` 或 `showcase` |
+| `GATEWAY_XFF_MODE` | `auto` | `off` / `ipv4` / `ipv6` / `mixed` / `auto` |
+| `GATEWAY_XFF_POOL` | `public` | `public` 或 `reserved` |
+| `GATEWAY_XFF_VARIANTS` | `false` | 是否随机改写地址文本写法 |
+| `GATEWAY_MAX_CONCURRENT` | `4` | 同时进行的生成数 |
+| `GATEWAY_SUBMIT_TIMEOUT` | `900` | 单任务总超时（秒） |
+| `GATEWAY_POLL_INTERVAL` | `3` | 轮询间隔（秒） |
+| `GATEWAY_TASK_RESUBMITS` | `8` | 上游判失败后的最大重投次数 |
+| `GATEWAY_RESUBMIT_BACKOFF` | `30` | 重投基础退避（秒），随次数递增，上限 5 倍 |
+| `GATEWAY_IMAGE_MAX_BYTES` | `20971520` | 输入图片上限 |
+| `GATEWAY_TASK_RETENTION` | `2000` | 本地保留的历史任务条数 |
+| `PROXY_LIST` | 空 | 逗号分隔的代理列表，支持 `socks5://` `http://` `https://` |
+| `GATEWAY_REQUIRE_API_KEY` | `false` | 是否强制 `/v1/*` 校验密钥 |
+| `GATEWAY_STUDIO_SESSION` | `true` | 工作台 Cookie 能否直接调用 `/v1/*` |
+| `GATEWAY_TRUST_PROXY` | `false` | 是否信任 `X-Forwarded-For` 记录客户端 IP |
+| `GATEWAY_PUBLIC_URL` | 空 | 对外地址，用于拼装下载链接 |
+
+> `.env.example` 里的变量名有自动化测试守护（`TestEnvExampleOnlyUsesKnownVariables`），
+> 代码里改了名字而文档没跟着改，测试会失败。
+
+---
+
+## 目录结构
+
+```
+.
+├── main.go                    入口：serve / probe / version / help，内嵌 web 资源
+├── go.mod                     模块声明（无任何第三方依赖）
+├── Dockerfile                 多阶段构建，非 root 运行
+├── docker-compose.yml         默认 bridge 网络，无 networks 段落
+├── .dockerignore
+├── .gitignore
+├── .env.example               全部环境变量与中文说明
+├── internal/
+│   ├── model/                 任务、密钥、管理员、实测记录的数据结构
+│   ├── config/                环境变量、运行时设置、归一化与校验
+│   ├── auth/                  PBKDF2 口令、API 密钥、HMAC 会话
+│   ├── store/                 单文件 JSON 数据库（原子写入 + 去抖落盘）
+│   ├── identity/              随机 IPv4/IPv6 生成、地址池、身份轮换
+│   ├── upstream/              上游客户端：提交、轮询、取片、配额、SOCKS5
+│   ├── pipeline/              任务编排：并发闸门、轮询、重投、视频缓存
+│   ├── xffprobe/              XFF / IPv6 配额键实测（含对照键方法）
+│   └── server/                HTTP 层：路由、鉴权、/v1 接口、后台接口
+├── web/
+│   ├── studio/                网页工作台（来自原版，资源路径已改写）
+│   └── admin/                 后台控制台（index.html / admin.css / admin.js）
+├── deploy/                    systemd 单元等非容器部署资产
+├── docs/                      上游接口分析、部署与验证记录
+├── CHANGELOG.md               更新说明
+└── README.md                  本文件
+```
+
+---
+
+## 常见问题
+
+**Q：后台登录不了 / 一直提示要改密码？**
+默认密码是 `admin`/`admin`。用默认密码登录后必须先改密码（至少 8 位），改完会自动
+换发会话，其它接口立刻可用。忘记密码时，删除数据文件里的 `users` 字段（或整个
+`h3gateway.json`）后重启，会重新按环境变量播种。
+
+**Q：`/v1/*` 返回 401，但我没配密钥？**
+说明数据里已经存在**已启用**的密钥，此时接口会自动要求鉴权。到后台「API 密钥」
+页面新建一个密钥，或用 `Authorization: Bearer <密钥>` 调用。
+
+**Q：提交一直卡在 `queued` / `running`？**
+上游排队时间可能长达十几分钟。任务在后台是异步的，可以随时关闭客户端，稍后
+用 `GET /v1/videos/{id}` 查结果。超过 `submit_timeout_sec` 会被判失败。
+
+**Q：视频下载 404？**
+只有 `succeeded` 的任务才有内容。失败任务请查看 `failure_reason`。
+
+**Q：上游返回 401 `login_required`？**
+说明用了 `showcase` 通道——该通道已被上游加上登录墙，匿名不可用。请把
+`GATEWAY_ENDPOINT_MODE` 改回 `plain`。
+
+**Q：任务失败提示 `Only JPG, PNG, or WEBP images are supported`？**
+输入图片格式不被上游接受，或 multipart 分片的 `Content-Type` 不对。网关会自动嗅探
+图片真实类型并设置正确的 `Content-Type`，请确认传入的确实是 JPG/PNG/WEBP。
+
+**Q：改了 `.env` 但没生效？**
+环境变量只在**首次启动**（数据文件不存在）时决定初始值。之后请在后台「运行设置」
+里修改，或删除数据文件重新开始。
+
+**Q：容器里的时间不对？**
+设置 `TZ` 环境变量（compose 默认 `Asia/Shanghai`）。
+
+**Q：想清空所有数据重来？**
+`docker compose down -v`（会一并删除数据卷）。
+
+---
+
+## 与 Python 原版的差异
+
+| 方面 | Python 原版 | 本 Go 版 |
+| --- | --- | --- |
+| 依赖 | FastAPI + uvicorn + httpx | **纯标准库**，无第三方依赖 |
+| 存储 | SQLite（部分版本为内存） | 单文件 JSON，原子写入 + 去抖落盘 |
+| 口令哈希 | 依赖第三方库 | 自实现 PBKDF2-HMAC-SHA256，21 万次迭代 |
+| 后台管理 | 无 | 完整单页控制台（仪表盘/任务/密钥/设置/实测/账号） |
+| API 密钥 | 静态配置 | 可增删改、可限速、可设有效期 |
+| IPv6 XFF | 未支持 | **已实测并支持**，含对照键验证方法与后台开关 |
+| 生成通道 | 走 `showcase` + prompt | 默认走 `plain`（`showcase` 已被上游登录墙拦截） |
+| 任务续跑 | 无 | 重启后自动接管未完成任务 |
+| 视频缓存 | 直接透传 | 成功后落地缓存，上游回收后仍可下载 |
+| 代理 | 支持 | 支持，且与 XFF 伪造互斥 |
+| 容器网络 | — | 明确只用默认 bridge，不创建项目网络 |
+
+行为上刻意保持一致的细节：时长别名映射（4-7→6s、8-12→10s、13-20→15s）、仅支持
+9:16 竖屏、`X-Forwarded-For` 取第一个值、默认提示词与 User-Agent/Referer 伪装。
+
+---
+
+## 开发
+
+```bash
+go build ./...            # 构建
+go vet ./...              # 静态检查
+gofmt -l .                # 格式检查
+go test ./...             # 全部单元测试（约 40 秒，不需要网络）
+```
+
+测试覆盖：口令与会话、环境变量与设置校验、随机地址生成与地址池、JSON 数据库与
+保留策略、上游客户端（含错误分类、multipart 头、代理与伪造互斥）、任务编排
+（并发闸门、重投、缓存、重启续跑）、XFF 实测方法（用可编程假上游验证「对照键」能
+识破退回真实 IP 的情况）、以及全部 HTTP 接口与后台流程。
+
+详细的上游接口分析见 [`docs/上游接口分析.md`](docs/上游接口分析.md)，
+部署与验证记录见 [`docs/部署与验证.md`](docs/部署与验证.md)，
+版本变更见 [`CHANGELOG.md`](CHANGELOG.md)。

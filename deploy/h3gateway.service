@@ -1,0 +1,70 @@
+[Unit]
+# H3Gateway —— systemd 单元（非容器部署）
+#
+# 安装：
+#   sudo useradd --system --home /var/lib/h3gateway --shell /usr/sbin/nologin h3gateway
+#   sudo install -m 0755 h3gateway /usr/local/bin/h3gateway
+#   sudo install -d -o h3gateway -g h3gateway -m 0750 /var/lib/h3gateway
+#   sudo install -d -m 0755 /etc/h3gateway
+#   sudo install -m 0640 -o root -g h3gateway .env.example /etc/h3gateway/h3gateway.env
+#   sudo install -m 0644 deploy/h3gateway.service /etc/systemd/system/h3gateway.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now h3gateway
+#
+# 查看状态与日志：
+#   systemctl status h3gateway
+#   journalctl -u h3gateway -f
+#
+# 升级：替换 /usr/local/bin/h3gateway 后 `sudo systemctl restart h3gateway`。
+# 数据（任务、密钥、设置、视频缓存）全部在 /var/lib/h3gateway，升级不会丢失。
+Description=H3Gateway - MiniMax-H3 image-to-video gateway
+Documentation=https://github.com/yhw5231/H3Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=h3gateway
+Group=h3gateway
+WorkingDirectory=/var/lib/h3gateway
+
+# 下面的 Environment= 只是**默认值**，故意写在 EnvironmentFile 之前：
+# systemd 按出现顺序合并，后出现的设置覆盖先出现的，因此配置文件里的值
+# （包括 GATEWAY_HOST=0.0.0.0）会覆盖这里的默认值。
+Environment=GATEWAY_HOST=127.0.0.1
+Environment=GATEWAY_PORT=8787
+Environment=GATEWAY_DATA_DIR=/var/lib/h3gateway
+
+# 配置文件可缺失，此时使用上面的默认值。
+EnvironmentFile=-/etc/h3gateway/h3gateway.env
+
+ExecStart=/usr/local/bin/h3gateway serve
+# 故意不提供 ExecReload：程序只处理 SIGINT/SIGTERM，SIGHUP 会直接终止进程。
+# 运行设置是持久化的、并且每个请求都实时读取，改完立即生效，无需 reload。
+# 需要重启请用 `systemctl restart h3gateway`。
+
+Restart=always
+RestartSec=3
+
+# ── 加固 ────────────────────────────────────────────────────────────────────
+# 只允许写入自己的数据目录；其余文件系统只读。
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# 唯一的可写路径。
+ReadWritePaths=/var/lib/h3gateway
+
+# 如需经代理访问上游，把代理地址写进 EnvironmentFile 的 PROXY_LIST。
+# 注意：配置代理后网关不再伪造 X-Forwarded-For，配额将按代理出口 IP 计算。
+
+[Install]
+WantedBy=multi-user.target

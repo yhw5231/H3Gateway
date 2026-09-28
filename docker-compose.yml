@@ -1,0 +1,79 @@
+# ---------------------------------------------------------------------------
+# H3Gateway —— 容器编排
+#
+# 网络说明（重要）：
+#   本项目**只使用 Docker 默认 bridge 网络**（network_mode: bridge）。
+#   因此本文件里**故意不写任何 `networks:` 段落**，`docker compose up` 不会创建
+#   `<项目名>_default` 之类的项目网络，也不会新建任何自定义网络。
+#
+#   验证方法：
+#     docker network ls                       # 记录当前列表
+#     docker compose up -d
+#     docker network ls                       # 列表应完全不变
+#
+#   如果确实需要与其它容器互通，请让那些容器也加入默认 bridge
+#   （`docker run --network bridge ...`），或在 compose 里改用
+#   `network_mode: "container:<名字>"`，仍然不要创建项目网络。
+# ---------------------------------------------------------------------------
+
+services:
+  h3gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${H3_VERSION:-compose}
+    image: ${H3_IMAGE:-h3gateway:latest}
+    container_name: ${H3_CONTAINER:-h3gateway}
+    # 使用容器默认 bridge 网络；不声明 networks，避免创建项目网络。
+    network_mode: bridge
+    restart: unless-stopped
+
+    # 只监听容器内部端口，通过端口映射对外暴露。
+    ports:
+      - "${H3_PORT:-8787}:8787"
+
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      GATEWAY_HOST: "0.0.0.0"
+      GATEWAY_PORT: "8787"
+      GATEWAY_DATA_DIR: "/data"
+      GATEWAY_LOG_LEVEL: "${GATEWAY_LOG_LEVEL:-info}"
+      # 首次启动时用于播种后台账号；默认 admin / admin。
+      GATEWAY_ADMIN_USER: "${GATEWAY_ADMIN_USER:-admin}"
+      GATEWAY_ADMIN_PASSWORD: "${GATEWAY_ADMIN_PASSWORD:-admin}"
+      # 留空则每次启动沿用数据目录里已保存的会话密钥。
+      GATEWAY_SESSION_SECRET: "${GATEWAY_SESSION_SECRET:-}"
+      # 随机公网 XFF：off | ipv4 | ipv6 | mixed | auto
+      GATEWAY_XFF_MODE: "${GATEWAY_XFF_MODE:-auto}"
+      GATEWAY_XFF_POOL: "${GATEWAY_XFF_POOL:-public}"
+      GATEWAY_XFF_VARIANTS: "${GATEWAY_XFF_VARIANTS:-false}"
+      GATEWAY_MAX_CONCURRENT: "${GATEWAY_MAX_CONCURRENT:-4}"
+      GATEWAY_REQUIRE_API_KEY: "${GATEWAY_REQUIRE_API_KEY:-false}"
+      GATEWAY_PUBLIC_URL: "${GATEWAY_PUBLIC_URL:-}"
+      TZ: "${TZ:-Asia/Shanghai}"
+
+    volumes:
+      # 单个数据卷即可覆盖：JSON 数据库、视频缓存、上传的原图。
+      - h3gateway-data:/data
+
+    # 容器默认 bridge 网络下没有内建 DNS 解析，健康检查走回环地址。
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  h3gateway-data:
+    name: ${H3_VOLUME:-h3gateway-data}

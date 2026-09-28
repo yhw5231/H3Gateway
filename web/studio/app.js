@@ -26,10 +26,10 @@ const state = {
 };
 
 const EXAMPLES = [
-  { name: "清晨六点", tag: "cinematic still", url: "/examples/ex1.jpg" },
-  { name: "球场之夜", tag: "stadium night", url: "/examples/ex2.jpg" },
-  { name: "能量街口", tag: "surreal street", url: "/examples/ex3.jpg" },
-  { name: "手作面团", tag: "kitchen top-down", url: "/examples/ex4.jpg" },
+  { name: "清晨六点", tag: "cinematic still", url: "/studio/examples/ex1.jpg" },
+  { name: "球场之夜", tag: "stadium night", url: "/studio/examples/ex2.jpg" },
+  { name: "能量街口", tag: "surreal street", url: "/studio/examples/ex3.jpg" },
+  { name: "手作面团", tag: "kitchen top-down", url: "/studio/examples/ex4.jpg" },
 ];
 
 /* ── toast ─────────────────────────────────────────────────── */
