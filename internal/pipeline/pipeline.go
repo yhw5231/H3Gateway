@@ -38,6 +38,11 @@ var ErrUpstreamReplay = errors.New("upstream replayed an earlier task")
 // replayed upstream task before it is reported as a failure.
 const maxSubmitReplays = 5
 
+// maxContentReplays caps how many repeated films are rejected before the gateway
+// hands one over anyway (flagged as a duplicate) rather than looping forever on
+// an upstream that only ever serves the same content.
+const maxContentReplays = 3
+
 // ErrImageRejected means the payload is not a usable image.
 var ErrImageRejected = errors.New("image rejected")
 
@@ -406,6 +411,10 @@ func (p *Pipeline) CancelTask(taskID string) {
 var retryableUpstreamError = regexp.MustCompile(`(?i)could not be started|try again|retryable|overload|timeout|timed out|busy|unavailable`)
 
 func (p *Pipeline) pollLoop(ctx context.Context, taskID string) {
+	// contentReplays counts films rejected for repeating content produced for a
+	// different image. Bounded so an upstream that only ever serves one video
+	// still finishes, with the duplicate flagged on the task.
+	contentReplays := 0
 	for {
 		settings := p.store.Settings()
 		if !sleepCtx(ctx, settings.PollInterval()+jitter(0, time.Second)) {
@@ -469,9 +478,26 @@ func (p *Pipeline) pollLoop(ctx context.Context, taskID string) {
 
 		switch status {
 		case model.StatusSucceeded:
+			if p.cacheVideo(ctx, t) {
+				// The bytes are identical to a film already produced for a
+				// different picture, so this task is about to hand the caller
+				// somebody else's render. Re-render under a fresh identity
+				// instead of delivering it.
+				if contentReplays < maxContentReplays && p.resubmit(ctx, t) {
+					contentReplays++
+					p.log.Warn("upstream repeated content it had already produced; resubmitting under a fresh identity",
+						"task", t.ID, "sha256", t.VideoSHA256, "same_as", t.DuplicateOf,
+						"replay", contentReplays, "attempt", t.Attempts)
+					t.VideoSHA256, t.DuplicateOf = "", ""
+					_ = os.Remove(p.VideoPath(t.ID))
+					p.store.SaveTask(t)
+					continue
+				}
+				p.log.Warn("upstream keeps returning already-seen content; delivering it flagged",
+					"task", t.ID, "sha256", t.VideoSHA256, "same_as", t.DuplicateOf)
+			}
 			t.Status = model.StatusSucceeded
 			p.store.SaveTask(t)
-			p.cacheVideo(ctx, t)
 			p.cleanupUpload(t.ID)
 			return
 		case model.StatusFailed, model.StatusCanceled:
@@ -567,55 +593,56 @@ func (p *Pipeline) cleanupUpload(taskID string) {
 }
 
 // cacheVideo best-effort downloads the finished MP4 so it survives upstream's
-// 1-2 day trial-task reaping.
-func (p *Pipeline) cacheVideo(ctx context.Context, t *model.Task) {
+// 1-2 day trial-task reaping. It reports whether the bytes duplicate a film that
+// was already produced for a different input image.
+func (p *Pipeline) cacheVideo(ctx context.Context, t *model.Task) bool {
 	path := p.VideoPath(t.ID)
-	if _, err := os.Stat(path); err == nil {
-		return
+	if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
+		return p.noteVideoHash(t, data)
 	}
 	if t.UpstreamTaskID == "" {
-		return
+		return false
 	}
 	ident := &identity.Identity{ClientID: t.ClientID, ForgedIP: t.ForgedIP, Family: t.IPFamily}
 	data, _, err := p.up.Content(ctx, t.UpstreamTaskID, t.AccessToken, ident, p.up.PickProxy())
 	if err != nil {
 		p.log.Warn("cannot cache video, will retry on download", "task", t.ID, "err", err)
-		return
+		return false
 	}
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		p.log.Warn("cannot write cached video", "task", t.ID, "err", err)
-		return
+		return false
 	}
-	p.recordVideoHash(t, data)
+	return p.noteVideoHash(t, data)
 }
 
-// recordVideoHash stores the content hash of a cached MP4 and marks the task when
-// those exact bytes were already delivered for a *different* input image.
+// noteVideoHash stores the content hash of a cached MP4 and reports whether those
+// exact bytes were already delivered for a *different* input image.
 //
 // The upstream trial channel animates whatever first frame it is given, so a
 // repeated video is either a cached render of the same picture (harmless) or
 // content that had nothing to do with this request (exactly the "every video
 // shows the same woman" report). The hashes tell the two apart instead of
 // leaving it to the eye.
-func (p *Pipeline) recordVideoHash(t *model.Task, data []byte) {
+func (p *Pipeline) noteVideoHash(t *model.Task, data []byte) bool {
 	hash := hashBytes(data)
 	if t.VideoSHA256 == hash {
-		return
+		return t.DuplicateOf != ""
 	}
 	other, dup := p.store.TaskByVideoHash(hash)
 	t.VideoSHA256 = hash
-	if dup && other.ID != t.ID {
-		if other.InputSHA256 != "" && other.InputSHA256 != t.InputSHA256 {
-			t.DuplicateOf = other.ID
-			p.log.Warn("upstream delivered content it had already produced for another image",
-				"task", t.ID, "upstream", t.UpstreamTaskID,
-				"same_as", other.ID, "same_upstream", other.UpstreamTaskID, "sha256", hash)
-		} else {
-			p.log.Debug("upstream returned the same bytes for the same input image",
-				"task", t.ID, "same_as", other.ID, "sha256", hash)
-		}
+	repeated := dup && other.ID != t.ID && other.InputSHA256 != "" && other.InputSHA256 != t.InputSHA256
+	if repeated {
+		t.DuplicateOf = other.ID
+		p.log.Warn("upstream delivered content it had already produced for another image",
+			"task", t.ID, "upstream", t.UpstreamTaskID,
+			"same_as", other.ID, "same_upstream", other.UpstreamTaskID, "sha256", hash)
+	} else if dup && other.ID != t.ID {
+		p.log.Debug("upstream returned the same bytes for the same input image",
+			"task", t.ID, "same_as", other.ID, "sha256", hash)
 	}
 	p.store.SaveTask(t)
+	return repeated
 }
 
 // hashBytes is the hex SHA-256 of a cached input image or finished video.
@@ -642,7 +669,7 @@ func (p *Pipeline) Content(ctx context.Context, t *model.Task) ([]byte, string, 
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		p.log.Warn("cannot cache video after download", "task", t.ID, "err", err)
 	} else {
-		p.recordVideoHash(t, data)
+		p.noteVideoHash(t, data)
 	}
 	return data, media, nil
 }

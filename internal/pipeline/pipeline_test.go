@@ -1160,7 +1160,7 @@ func TestDefaultPromptIsForwardedWhenTheCallerSendsNone(t *testing.T) {
 	settle(t, h, first.ID)
 
 	second, err := h.pipe.Submit(context.Background(), SubmitRequest{
-		Image: jpegBytesB, Filename: "b.jpg", Prompt: "a red apple on a wooden table",
+		Image: jpegBytes, Filename: "b.jpg", Prompt: "a red apple on a wooden table",
 	})
 	if err != nil {
 		t.Fatalf("submit with prompt: %v", err)
@@ -1235,5 +1235,133 @@ func TestRepeatedVideoForAnotherImageIsFlagged(t *testing.T) {
 	}
 	if other.InputSHA256 == same.InputSHA256 {
 		t.Fatalf("fixture broken: both tasks recorded the same input hash")
+	}
+	if other.Attempts == 0 {
+		t.Fatalf("a repeated film should have been re-rendered before being handed over")
+	}
+}
+
+// stickyContentTrial models an upstream that answers a brand new image with a
+// film it already produced, and only renders something new once the gateway
+// rotates the identity and submits again.
+type stickyContentTrial struct {
+	mu     sync.Mutex
+	seq    int
+	images []string
+	tasks  map[string]string
+}
+
+func (f *stickyContentTrial) handler() http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/minimax-trial/video-generation", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(8 << 20); err != nil {
+			http.Error(w, "bad form", http.StatusBadRequest)
+			return
+		}
+		tag := "A"
+		if file, _, err := r.FormFile("image"); err == nil {
+			body, _ := io.ReadAll(file)
+			_ = file.Close()
+			if strings.Contains(string(body), "BBBB") {
+				tag = "B"
+			}
+		}
+
+		f.mu.Lock()
+		f.seq++
+		f.images = append(f.images, tag)
+		id := fmt.Sprintf("up-%d", f.seq)
+		// The first two submissions deliver the very same film although the
+		// images differ; only a later attempt renders the new picture.
+		film := "FILM-ONE"
+		if f.seq > 2 {
+			film = "FILM-TWO"
+		}
+		if f.tasks == nil {
+			f.tasks = map[string]string{}
+		}
+		f.tasks[id] = film
+		f.mu.Unlock()
+
+		writeJSON(w, map[string]any{
+			"task_id": id, "access_token": "tok-" + id, "status": "queued",
+			"limit": 2, "remaining": 1, "max_concurrent": 5,
+		})
+	})
+
+	mux.HandleFunc("/api/minimax-trial/video-generation/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/content") {
+			name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/minimax-trial/video-generation/"), "/content")
+			f.mu.Lock()
+			body, ok := f.tasks[name]
+			f.mu.Unlock()
+			if !ok {
+				http.Error(w, "gone", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "video/mp4")
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		writeJSON(w, map[string]any{"status": "succeeded", "task_id": "up"})
+	})
+
+	return mux
+}
+
+// TestRepeatedContentIsReRenderedInsteadOfDelivered covers the active half of the
+// content check: a film that belongs to another picture must not be handed to the
+// caller as this request's result, so the task is resubmitted under a fresh
+// identity and the caller gets the real render.
+func TestRepeatedContentIsReRenderedInsteadOfDelivered(t *testing.T) {
+	fake := &stickyContentTrial{}
+	srv := httptest.NewServer(fake.handler())
+	t.Cleanup(srv.Close)
+
+	h := newHarnessOn(t, srv, func(s *config.Settings) {
+		s.XFFMode = config.XFFIPv4
+		s.PollIntervalSec = 0.2
+	})
+
+	render := func(image []byte) *model.Task {
+		t.Helper()
+		task, err := h.pipe.Submit(context.Background(), SubmitRequest{Image: image, Filename: "r.jpg"})
+		if err != nil {
+			t.Fatalf("submit: %v", err)
+		}
+		done := settle(t, h, task.ID)
+		if done.Status != model.StatusSucceeded {
+			t.Fatalf("task ended %s: %s", done.Status, done.Error)
+		}
+		return done
+	}
+
+	render(jpegBytes)
+
+	second := render(jpegBytesB)
+	if second.Attempts == 0 {
+		t.Fatalf("the repeated film was delivered without re-rendering: %+v", second)
+	}
+	if second.DuplicateOf != "" {
+		t.Fatalf("a successfully re-rendered task must not stay flagged: %+v", second)
+	}
+	body, _, err := h.pipe.Content(context.Background(), second)
+	if err != nil {
+		t.Fatalf("content: %v", err)
+	}
+	if string(body) != "FILM-TWO" {
+		t.Fatalf("delivered %q, want the re-rendered FILM-TWO", body)
+	}
+
+	fake.mu.Lock()
+	submissions := fake.seq
+	images := append([]string(nil), fake.images...)
+	fake.mu.Unlock()
+	if submissions < 3 {
+		t.Fatalf("upstream saw %d submissions (%v), want a resubmit after the repeat", submissions, images)
+	}
+	if len(images) < 3 || images[2] != "B" {
+		t.Fatalf("the resubmit must carry the caller's own image, got %v", images)
 	}
 }
