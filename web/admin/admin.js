@@ -13,6 +13,10 @@ const state = {
   taskLimit: 25,
   taskTotal: 0,
   keyCache: [],
+  // Plaintext secrets are fetched one at a time, only when the operator asks to
+  // see or copy one, and cached for the rest of the session.
+  keySecrets: new Map(),
+  keyRevealed: new Set(),
 };
 
 /* ── HTTP ──────────────────────────────────────────────────── */
@@ -46,6 +50,30 @@ function toast(msg, kind = "", ms = 3200) {
   el.textContent = msg;
   $("#toasts").appendChild(el);
   setTimeout(() => el.remove(), ms);
+}
+
+/* ── clipboard ─────────────────────────────────────────────── */
+// navigator.clipboard only exists in a secure context, and the console is
+// routinely opened over plain http on a LAN address. Fall back to the legacy
+// execCommand path so "复制" never depends on https.
+async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    try { await navigator.clipboard.writeText(text); return true; } catch { /* fall through */ }
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  } catch { return false; }
 }
 
 function esc(s) {
@@ -382,11 +410,25 @@ async function loadKeys() {
   try {
     const d = await api("/admin/api/keys");
     state.keyCache = d.items || [];
+    // Drop cached plaintext (and reveal state) for keys that no longer exist.
+    const live = new Set(state.keyCache.map((k) => k.id));
+    for (const id of Array.from(state.keySecrets.keys())) {
+      if (!live.has(id)) { state.keySecrets.delete(id); state.keyRevealed.delete(id); }
+    }
     renderKeys(d);
   } catch (err) {
     if (err.status === 401) return showLogin();
     toast(err.message, "err");
   }
+}
+
+// keySecret fetches the plaintext of one key, at most once per session.
+async function keySecret(id) {
+  if (state.keySecrets.has(id)) return state.keySecrets.get(id);
+  const d = await api(`/admin/api/keys/${encodeURIComponent(id)}/secret`);
+  const secret = d.key || "";
+  state.keySecrets.set(id, secret);
+  return secret;
 }
 
 function renderKeys(d) {
@@ -399,7 +441,12 @@ function renderKeys(d) {
 
   $("#key-rows").innerHTML = state.keyCache.map((k) => `<tr>
     <td>${esc(k.name)}${k.note ? `<div class="muted small">${esc(k.note)}</div>` : ""}</td>
-    <td class="mono small">${esc(k.prefix)}</td>
+    <td class="small">${keyCell(k)}
+      <div class="row" style="gap:6px;margin-top:5px">
+        <button class="btn sm" data-kact="reveal" data-id="${esc(k.id)}" data-on="${state.keyRevealed.has(k.id) ? "1" : "0"}">${state.keyRevealed.has(k.id) ? "隐藏" : "显示"}</button>
+        <button class="btn sm" data-kact="copy" data-id="${esc(k.id)}">复制</button>
+      </div>
+    </td>
     <td>${k.expired ? '<span class="badge err">已过期</span>' : (k.enabled ? '<span class="badge ok">启用</span>' : '<span class="badge">停用</span>')}</td>
     <td class="small">${esc(k.requests || 0)}</td>
     <td class="small nowrap">${fmtTime(k.last_used_at)}</td>
@@ -412,11 +459,52 @@ function renderKeys(d) {
   </tr>`).join("") || `<tr><td colspan="8" class="empty">还没有 API 密钥</td></tr>`;
 }
 
+// keyCell renders either the masked prefix or the plaintext already revealed.
+function keyCell(k) {
+  const shown = state.keyRevealed.has(k.id) ? state.keySecrets.get(k.id) : "";
+  return shown
+    ? `<span class="mono" data-keytext style="word-break:break-all">${esc(shown)}</span>`
+    : `<span class="mono" data-keytext>${esc(k.prefix)}</span>`;
+}
+
 $("#key-rows").addEventListener("click", async (e) => {
   const btn = e.target.closest("button[data-kact]");
   if (!btn) return;
   const id = btn.dataset.id;
-  if (btn.dataset.kact === "toggle") {
+  const act = btn.dataset.kact;
+
+  if (act === "reveal" || act === "copy") {
+    let secret;
+    try { secret = await keySecret(id); }
+    catch (err) { toast(err.message, "err"); return; }
+    if (act === "copy") {
+      const ok = await copyText(secret);
+      toast(ok ? "完整密钥已复制" : "复制失败，请点「显示」后手动选中", ok ? "ok" : "err");
+      return;
+    }
+    const tr = btn.closest("tr");
+    const cell = tr && tr.querySelector("[data-keytext]");
+    if (state.keyRevealed.has(id)) {
+      state.keyRevealed.delete(id);
+      btn.dataset.on = "0";
+      btn.textContent = "显示";
+      if (cell) {
+        cell.style.wordBreak = "";
+        cell.textContent = (state.keyCache.find((k) => k.id === id) || {}).prefix || "";
+      }
+    } else {
+      state.keyRevealed.add(id);
+      btn.dataset.on = "1";
+      btn.textContent = "隐藏";
+      if (cell) {
+        cell.style.wordBreak = "break-all";
+        cell.textContent = secret;
+      }
+    }
+    return;
+  }
+
+  if (act === "toggle") {
     try {
       await api(`/admin/api/keys/${encodeURIComponent(id)}`, {
         method: "PATCH", body: { enabled: btn.dataset.on !== "1" },
@@ -425,10 +513,12 @@ $("#key-rows").addEventListener("click", async (e) => {
       loadKeys();
     } catch (err) { toast(err.message, "err"); }
   }
-  if (btn.dataset.kact === "del") {
+  if (act === "del") {
     if (!confirm(`确认删除密钥「${btn.dataset.name}」？使用该密钥的客户端会立即失效。`)) return;
     try {
       await api(`/admin/api/keys/${encodeURIComponent(id)}`, { method: "DELETE" });
+      state.keySecrets.delete(id);
+      state.keyRevealed.delete(id);
       toast("已删除", "ok");
       loadKeys();
     } catch (err) { toast(err.message, "err"); }
@@ -474,7 +564,7 @@ $("#key-new").onclick = () => {
 function showNewKey(k) {
   openModal(`
     <h3>密钥已创建</h3>
-    <div class="banner warn" style="margin-bottom:14px"><div>完整密钥只显示这一次，请立即复制保存。</div></div>
+    <div class="banner warn" style="margin-bottom:14px"><div>请立即复制保存。之后仍可在密钥列表里点「显示」查看、点「复制」再次复制。</div></div>
     <label class="field"><span class="lb">${esc(k.name)}</span>
       <input type="text" id="newkey" class="mono" readonly value="${esc(k.key)}" /></label>
     <div class="row end">
@@ -485,8 +575,9 @@ function showNewKey(k) {
     m.querySelector("#copykey").onclick = async () => {
       const input = m.querySelector("#newkey");
       input.select();
-      try { await navigator.clipboard.writeText(k.key); toast("已复制", "ok"); }
-      catch { document.execCommand("copy"); toast("已复制", "ok"); }
+      input.setSelectionRange(0, k.key.length);
+      const ok = await copyText(k.key);
+      toast(ok ? "已复制" : "复制失败，请手动复制", ok ? "ok" : "err");
     };
   });
 }

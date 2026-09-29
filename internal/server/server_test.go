@@ -902,6 +902,27 @@ func TestAdminKeyLifecycle(t *testing.T) {
 		t.Fatalf("key list missing the new key: %s", body)
 	}
 
+	// The explicit reveal endpoint hands the plaintext back for display/copy.
+	resp, _ = e.do(t, "GET", "/admin/api/keys/"+id+"/secret", nil, nil)
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("reveal without a session = %d, want an auth failure", resp.StatusCode)
+	}
+	resp, body = e.do(t, "GET", "/admin/api/keys/"+id+"/secret", nil, withCookie(cookie))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("reveal key = %d %s", resp.StatusCode, body)
+	}
+	revealed := decode(t, body)
+	if got, _ := revealed["key"].(string); got != secret {
+		t.Fatalf("revealed key = %q, want the created secret", got)
+	}
+	if got, _ := revealed["id"].(string); got != id {
+		t.Fatalf("revealed id = %q, want %q", got, id)
+	}
+	resp, _ = e.do(t, "GET", "/admin/api/keys/does-not-exist/secret", nil, withCookie(cookie))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("reveal unknown key = %d, want 404", resp.StatusCode)
+	}
+
 	// Disable it.
 	resp, body = e.do(t, "PATCH", "/admin/api/keys/"+id, map[string]any{"enabled": false}, adminHeaders(cookie))
 	if resp.StatusCode != http.StatusOK {

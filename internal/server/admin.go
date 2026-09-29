@@ -431,6 +431,23 @@ func (s *Server) handleAdminKeyCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, view)
 }
 
+// handleAdminKeyReveal returns the full secret of one key. The list endpoint
+// stays masked, so plaintext leaves the server only on this explicit request.
+func (s *Server) handleAdminKeyReveal(w http.ResponseWriter, r *http.Request) {
+	k, ok := s.store.GetKey(r.PathValue("id"))
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "密钥不存在"})
+		return
+	}
+	s.log.Info("api key revealed", "name", k.Name, "id", k.ID, "client", s.clientIP(r))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":     k.ID,
+		"name":   k.Name,
+		"key":    k.Key,
+		"prefix": auth.KeyPrefix(k.Key),
+	})
+}
+
 type keyUpdateRequest struct {
 	Name            *string `json:"name"`
 	Note            *string `json:"note"`

@@ -119,6 +119,7 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /admin/api/tasks/{id}/retry", s.adminAuth(s.handleAdminTaskRetry))
 	m.HandleFunc("GET /admin/api/keys", s.adminAuth(s.handleAdminKeys))
 	m.HandleFunc("POST /admin/api/keys", s.adminAuth(s.handleAdminKeyCreate))
+	m.HandleFunc("GET /admin/api/keys/{id}/secret", s.adminAuth(s.handleAdminKeyReveal))
 	m.HandleFunc("PATCH /admin/api/keys/{id}", s.adminAuth(s.handleAdminKeyUpdate))
 	m.HandleFunc("DELETE /admin/api/keys/{id}", s.adminAuth(s.handleAdminKeyDelete))
 	m.HandleFunc("GET /admin/api/settings", s.adminAuth(s.handleAdminSettingsGet))
