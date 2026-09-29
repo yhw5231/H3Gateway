@@ -203,14 +203,19 @@
         <label class="field">
           <span class="lb">生成通道</span>
           <select id="set-endpoint-mode">
-            <option value="plain">plain · /video-generation（匿名可用，实测可用）</option>
-            <option value="showcase">showcase · /showcase/video-generation（当前需要登录）</option>
+            <option value="showcase">showcase · /showcase/video-generation（默认，成片全程保持首帧图）</option>
+            <option value="plain">plain · /video-generation（备用，约 3.5s 后画面会脱离首帧图）</option>
           </select>
-          <div class="help">上游试用页当前走 plain 通道；showcase 通道会返回 <span class="code-inline">login_required</span>，仅在重新开放时选用。</div>
+          <div class="help">showcase 是原项目使用的通道，实测整段成片都保持上传的首帧图且 <span class="code-inline">prompt</span> 生效；plain 匿名可用，但会在约 3.5s 后切到固定的 showcase 编排，成片与上传的图不符。</div>
         </label>
         <label class="field">
-          <span class="lb">showcase_id（仅 showcase 通道使用）</span>
+          <span class="lb">showcase_id <span class="muted small">（showcase 通道必填）</span></span>
           <input type="text" id="set-showcase" />
+        </label>
+        <label class="field">
+          <span class="lb">来源站点 <span class="muted small">（sourceHost 表单字段）</span></span>
+          <input type="text" id="set-source-host" placeholder="siftq.com" />
+          <div class="help">与「上游地址」解耦：把上游指向镜像或本地 mock 时仍声明真实来源站点。</div>
         </label>
         <label class="field">
           <span class="lb">默认提示词 <span class="muted small">（调用方不传 prompt 时套用；会转发给上游，上游是否采纳取决于通道）</span></span>

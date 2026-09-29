@@ -245,7 +245,7 @@ function renderDashXFF(d) {
     <dt>地址池</dt><dd>${s.xff_pool === "reserved" ? "保留/文档地址段" : "公网地址"}</dd>
     <dt>文本变体</dt><dd>${s.xff_variants ? "开启" : "关闭"}</dd>
     <dt>代理模式</dt><dd>${r.proxy_mode ? "已配置代理（不伪造 XFF）" : "直连（伪造 XFF）"}</dd>
-    <dt>接口通道</dt><dd>${s.endpoint_mode === "showcase" ? "showcase" : "plain"}</dd>
+    <dt>接口通道</dt><dd>${s.endpoint_mode === "plain" ? "plain（画面会脱离首帧图）" : "showcase（保持首帧图）"}</dd>
     <dt>上游地址</dt><dd class="mono">${esc(s.upstream_base || "-")}</dd>`;
 }
 
@@ -603,8 +603,9 @@ function fillSettings(s, d) {
   $("#set-xff-variants").checked = !!s.xff_variants;
   $("#set-upstream").value = s.upstream_base || "";
   $("#set-trial-base").value = s.trial_base || "";
-  $("#set-endpoint-mode").value = s.endpoint_mode || "plain";
+  $("#set-endpoint-mode").value = s.endpoint_mode || "showcase";
   $("#set-showcase").value = s.showcase_id || "";
+  $("#set-source-host").value = s.source_host || "";
   $("#set-prompt").value = s.default_prompt || "";
   $("#set-max-conc").value = s.max_concurrent;
   $("#set-submit-timeout").value = s.submit_timeout_sec;
@@ -646,6 +647,7 @@ $("#set-save").onclick = async () => {
     trial_base: $("#set-trial-base").value.trim(),
     endpoint_mode: $("#set-endpoint-mode").value,
     showcase_id: $("#set-showcase").value.trim(),
+    source_host: $("#set-source-host").value.trim(),
     default_prompt: $("#set-prompt").value,
     max_concurrent: parseInt($("#set-max-conc").value, 10) || 0,
     submit_timeout_sec: parseInt($("#set-submit-timeout").value, 10) || 0,

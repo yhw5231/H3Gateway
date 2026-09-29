@@ -432,12 +432,69 @@ func TestPickProxyRotatesAndRespectsEmptyList(t *testing.T) {
 	}
 }
 
-func TestHostOf(t *testing.T) {
-	if got := hostOf("https://siftq.com/api/minimax-trial"); got != "siftq.com" {
-		t.Fatalf("hostOf = %q", got)
-	}
-	if got := hostOf("://bad"); got != "siftq.com" {
-		t.Fatalf("hostOf fallback = %q", got)
+// TestSubmitAlwaysSendsShowcaseFields guards the regression behind "the video
+// has nothing to do with the picture I uploaded": the showcase endpoint keeps
+// the uploaded first frame for the whole clip, and it rejects a submission that
+// omits showcase_id (400 "Invalid Showcase generation parameters."). The Python
+// original therefore always posted showcase_id, sourceHost and prompt — and so
+// must this client, in either endpoint mode.
+func TestSubmitAlwaysSendsShowcaseFields(t *testing.T) {
+	for _, mode := range []string{config.EndpointShowcase, config.EndpointPlain} {
+		t.Run(mode, func(t *testing.T) {
+			type captured struct {
+				path string
+				form url.Values
+			}
+			got := make(chan captured, 1)
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := r.ParseMultipartForm(1 << 20); err != nil {
+					t.Errorf("ParseMultipartForm: %v", err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				got <- captured{path: r.URL.Path, form: r.MultipartForm.Value}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"task_id":"t1","access_token":"tok","status":"queued"}`))
+			}))
+			defer srv.Close()
+
+			settings := config.DefaultSettings()
+			settings.UpstreamBase = srv.URL
+			settings.EndpointMode = mode
+			settings.Normalize()
+			c := New(func() config.Settings { return settings })
+			defer c.Close()
+
+			ident := &identity.Identity{ClientID: "mmtrial_t", VisitorID: "mmguest_t", ForgedIP: "203.0.113.7"}
+			// An empty caller prompt must still reach upstream as the configured
+			// default, never as a missing field.
+			if _, err := c.Submit(context.Background(), SubmitOptions{
+				Image: []byte{0xff, 0xd8, 0xff, 0xe0}, Ratio: "9:16", Duration: 6,
+			}, ident, ""); err != nil {
+				t.Fatalf("Submit: %v", err)
+			}
+
+			c2 := <-got
+			wantPath := "/api/minimax-trial/video-generation"
+			if mode == config.EndpointShowcase {
+				wantPath = "/api/minimax-trial/showcase/video-generation"
+			}
+			if c2.path != wantPath {
+				t.Fatalf("path = %q, want %q", c2.path, wantPath)
+			}
+			if c2.form.Get("showcase_id") != settings.ShowcaseID {
+				t.Fatalf("showcase_id = %q, want %q", c2.form.Get("showcase_id"), settings.ShowcaseID)
+			}
+			if c2.form.Get("prompt") != settings.DefaultPrompt {
+				t.Fatalf("prompt = %q, want the configured default", c2.form.Get("prompt"))
+			}
+			// sourceHost must describe the real originating site, not whatever
+			// host UpstreamBase happens to point at (here: the test server).
+			if c2.form.Get("sourceHost") != "siftq.com" {
+				t.Fatalf("sourceHost = %q, want siftq.com", c2.form.Get("sourceHost"))
+			}
+		})
 	}
 }
 

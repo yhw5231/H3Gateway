@@ -16,6 +16,14 @@ import (
 	"github.com/yhw5231/H3Gateway/internal/upstream"
 )
 
+// serveGenerationOnBothPaths registers a generation handler for the plain and
+// the showcase endpoint alike: the real service serves the same trial API under
+// both prefixes, and the gateway submits to whichever one is configured.
+func serveGenerationOnBothPaths(mux *http.ServeMux, h http.HandlerFunc) {
+	mux.HandleFunc("/api/minimax-trial/video-generation", h)
+	mux.HandleFunc("/api/minimax-trial/showcase/video-generation", h)
+}
+
 // fakeUpstream reproduces the quota behaviour that was observed on the real
 // service: two anonymous generations per X-Forwarded-For value per day.
 //
@@ -71,7 +79,7 @@ func (f *fakeUpstream) handler() http.Handler {
 			"anonymous_daily_limit": dailyLimit, "max_concurrent": 5,
 		})
 	})
-	mux.HandleFunc("/api/minimax-trial/video-generation", func(w http.ResponseWriter, r *http.Request) {
+	serveGenerationOnBothPaths(mux, func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		if f.rejectAll {

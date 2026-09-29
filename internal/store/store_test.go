@@ -1,6 +1,8 @@
 package store
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -25,6 +27,71 @@ func mkTask(id, status string) *model.Task {
 	now := time.Now()
 	return &model.Task{ID: id, Status: status, Model: "minimax-h3", Ratio: "9:16",
 		Duration: 6, CreatedAt: now, UpdatedAt: now}
+}
+
+// TestStoredPlainEndpointIsMigratedOnce covers the upgrade path behind "the
+// video has nothing to do with the picture I uploaded": v1 shipped
+// `endpoint_mode: plain` as its default and persisted it, so a stored document
+// would otherwise keep submitting to the endpoint that abandons the uploaded
+// image, no matter what the new default is.
+func TestStoredPlainEndpointIsMigratedOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "h3gateway.json")
+	v1 := `{"version":1,"secret":"s","settings":{"endpoint_mode":"plain","max_concurrent":4}}`
+	if err := os.WriteFile(path, []byte(v1), 0o600); err != nil {
+		t.Fatalf("seed v1 document: %v", err)
+	}
+
+	st, err := Open(path, config.DefaultSettings())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if got := st.Settings().EndpointMode; got != config.EndpointShowcase {
+		t.Fatalf("stored plain endpoint must be repaired to showcase, got %q", got)
+	}
+	// The repair must not clobber the rest of the stored document.
+	if got := st.Settings().MaxConcurrent; got != 4 {
+		t.Fatalf("max_concurrent = %d, want the stored 4", got)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	var doc document
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if doc.Version != documentVersion {
+		t.Fatalf("document version = %d, want %d", doc.Version, documentVersion)
+	}
+	if doc.Settings == nil || doc.Settings.EndpointMode != config.EndpointShowcase {
+		t.Fatalf("persisted endpoint = %+v", doc.Settings)
+	}
+
+	// A deliberate plain choice made afterwards must survive: the repair is
+	// stamped with the current version, so it never runs a second time.
+	st2, err := Open(path, config.DefaultSettings())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	next := st2.Settings()
+	next.EndpointMode = config.EndpointPlain
+	st2.UpdateSettings(next)
+	if err := st2.Close(); err != nil {
+		t.Fatalf("close after deliberate choice: %v", err)
+	}
+
+	st3, err := Open(path, config.DefaultSettings())
+	if err != nil {
+		t.Fatalf("reopen2: %v", err)
+	}
+	defer st3.Close()
+	if got := st3.Settings().EndpointMode; got != config.EndpointPlain {
+		t.Fatalf("a deliberate plain choice must survive, got %q", got)
+	}
 }
 
 func TestOpenCreatesFileAndStableSecret(t *testing.T) {

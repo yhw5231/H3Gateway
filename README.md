@@ -370,7 +370,7 @@ curl -X POST http://127.0.0.1:8787/v1/videos \
 | --- | --- | --- |
 | `image` | ✅ | 图片本体（multipart 的 `image` 字段），或 JSON 里的 `data:image/...;base64,...` / `http(s)` 链接 |
 | `model` | | 默认 `minimax-h3`。模型名以 `-10s` / `-15s` 结尾可指定时长 |
-| `prompt` | | 提示词。留空时套用设置里的 `default_prompt`（后台「设置」页可改）。会转发给上游，但**该通道的上游前端本身不发送 prompt**；通道实测渲染的是你给的那张首帧图（见 [`docs/上游接口分析.md`](docs/上游接口分析.md) 第 9 节） |
+| `prompt` | | 提示词。留空时套用设置里的 `default_prompt`（后台「设置」页可改）。**只有 `showcase` 通道（默认）会采纳它**；`plain` 通道忽略 prompt（见 [`docs/上游接口分析.md`](docs/上游接口分析.md) 第 5、9 节） |
 | `duration` / `seconds` | | 4-7 → 6 秒，8-12 → 10 秒，13-20 → 15 秒；默认 6 秒 |
 | `ratio` / `size` | | 仅支持竖屏 9:16（上游硬限制）。接受 `9:16`、`720x1280`、`1080x1920`、`vertical`、`portrait` |
 
@@ -428,7 +428,7 @@ curl -X POST http://127.0.0.1:8787/v1/videos \
   "xff_mode": "auto",
   "effective_xff_mode": "mixed",
   "ipv6_supported": true,
-  "endpoint_mode": "plain"
+  "endpoint_mode": "showcase"
 }
 ```
 
@@ -474,7 +474,9 @@ curl -X POST http://127.0.0.1:8787/v1/videos \
 | `GATEWAY_SESSION_SECRET` | 随机生成并落盘 | 会话签名密钥 |
 | `GATEWAY_API_KEY` | 空 | 首次启动时导入一个 API 密钥 |
 | `GATEWAY_UPSTREAM` | `https://siftq.com` | 上游地址 |
-| `GATEWAY_ENDPOINT_MODE` | `plain` | `plain` 或 `showcase` |
+| `GATEWAY_ENDPOINT_MODE` | `showcase` | `showcase`（默认，成片全程保持首帧图）或 `plain`（约 3.5s 后画面会脱离首帧图） |
+| `GATEWAY_SHOWCASE_ID` | `case-mtqzygu8` | showcase 通道的素材 ID，**该端点的必填字段** |
+| `GATEWAY_SOURCE_HOST` | `siftq.com` | `sourceHost` 表单字段，与 `GATEWAY_UPSTREAM` 解耦 |
 | `GATEWAY_XFF_MODE` | `auto` | `off` / `ipv4` / `ipv6` / `mixed` / `auto` |
 | `GATEWAY_XFF_POOL` | `public` | `public` 或 `reserved` |
 | `GATEWAY_XFF_VARIANTS` | `false` | 是否随机改写地址文本写法 |
@@ -547,7 +549,13 @@ curl -X POST http://127.0.0.1:8787/v1/videos \
 只有 `succeeded` 的任务才有内容。失败任务请查看 `failure_reason`。
 
 **Q：出来的视频和输入的图不对应？再点一次「开拍」拿到的是上一段视频？**
-这是上游的「身份绑定」行为：它把**首帧图**和**创建的任务**绑在提交它们的身份
+先看 `GET /v1/trial/usage` 里的 `endpoint_mode`。**`plain` 通道本身就会导致这个现象**：
+实测同图同提示词，`plain` 的成片只有前约 3.5s 还贴着上传的首帧图，之后画面直接切到固定的
+showcase 编排上（ORB+RANSAC 内点数 156 → 65 → 9 → 0，此后全程为 0，与输入图无关）；
+`showcase` 通道则整段 6.58s 都保持首帧图（内点全程 181~208）。因此本版默认走 `showcase`
+（即原项目的通道）；升级时若数据文件里存着旧的 `plain`，启动会自动迁移到 `showcase`。
+
+在此之外才是上游的「身份绑定」行为：它把**首帧图**和**创建的任务**绑在提交它们的身份
 （`X-Forwarded-For` + `client_id`）上，复用身份就会渲染旧图、或被直接交回旧任务。
 网关的应对是**一次生成一个身份**，并且在校验到上游交回旧任务时退休身份换新重投，
 连续失败会返回 `502 upstream_replay` 而不会把旧视频当新结果返回。请确认：
@@ -555,24 +563,27 @@ curl -X POST http://127.0.0.1:8787/v1/videos \
 并核对两个任务的 `upstream_task_id` 是否不同——相同即命中了上面这条，升级到本版本即可。
 
 **Q：为什么每条视频里都出现一个女人，结尾还都是一个「飞吻」动作？**
-分三层排查（实测数据见 [`docs/上游接口分析.md`](docs/上游接口分析.md) 第 9 节）：
+分三层排查（实测数据见 [`docs/上游接口分析.md`](docs/上游接口分析.md) 第 5、9 节）：
 
-1. **同一条片子被复用**。上游可能换个任务号把同一条内容再发一次。网关会先自己拦下来：
+1. **生成通道选错了（最常见）**。`plain`（`/video-generation`）会在约 3.5s 后把画面切到
+   固定的 showcase 编排上，人物与「飞吻」结尾都来自那段编排，与上传的图无关。把
+   `GATEWAY_ENDPOINT_MODE` 设为 `showcase`（本版默认）即可——实测该通道整段都保持首帧图。
+2. **同一条片子被复用**。上游可能换个任务号把同一条内容再发一次。网关会先自己拦下来：
    成片字节与更早任务相同、而**输入图不同**时**不予交付**，退休身份换幂等键重投（最多 3 次），
    拿到真正属于这张图的成片才交付；上游若始终只给同一条内容，才交付并在任务上置
    `duplicate_of`（日志同时 `WARN`）。也可以直接对比两次提交的 `video_sha256`——
    值相同就是同一条片子。任务号级的复读更早一步：直接返回 `502 upstream_replay`。
-2. **输入图本身就是那样**。匿名试用通道渲染的就是你给的那张首帧图——实测把一张合成的
-   纯绿几何图提交上去，成片全程绿色像素占比 0.62~0.64、肤色像素 **0.00**，即通道不会
-   凭空塞进人物；把提示词留空时套用的是设置里的 `default_prompt`，可以按需改成更强的
-   「保持输入图主体、不要添加人物或图中没有的动作」。
-3. **请求没走这条通道**。上游 `showcase` 通道（登录墙，见第 5 节）与第三方聚合服务返回的是
-   素材库里的成片：素材库 22 条全部是人物类，其中三条的编排动作明确以「朝镜头/屏幕亲吻」
-   （飞吻）收尾。若客户端里配了别的渠道或聚合服务，请核对实际请求的地址与模型名。
+3. **输入图本身就是那样**。通道渲染的是你给的那张首帧图——实测把一张合成的纯绿几何图
+   提交上去，成片全程绿色像素占比 0.62~0.64、肤色像素 **0.00**，即通道不会凭空塞进人物；
+   把提示词留空时套用的是设置里的 `default_prompt`，可以按需改成更强的
+   「保持输入图主体、不要添加人物或图中没有的动作」。第三方聚合服务返回的则是素材库
+   成片：素材库 22 条全部是人物类，其中三条的编排动作明确以「朝镜头/屏幕亲吻」收尾。
 
 **Q：上游返回 401 `login_required`？**
-说明用了 `showcase` 通道——该通道已被上游加上登录墙，匿名不可用。请把
-`GATEWAY_ENDPOINT_MODE` 改回 `plain`。
+该身份被上游单独拦截了。网关会自动退休该身份并用新身份重投；连续 6 次都被拒才会失败，
+那说明上游策略变更（`showcase` 通道曾在某段时间需要登录）。此时可临时切到
+`GATEWAY_ENDPOINT_MODE=plain` 应急，但注意 `plain` 的成片会脱离上传的首帧图，
+且**不接受 `showcase_id` 之外的差异**——它是可用的降级通道，不是等价替代。
 
 **Q：任务失败提示 `Only JPG, PNG, or WEBP images are supported`？**
 输入图片格式不被上游接受，或 multipart 分片的 `Content-Type` 不对。网关会自动嗅探
@@ -600,7 +611,7 @@ curl -X POST http://127.0.0.1:8787/v1/videos \
 | 后台管理 | 无 | 完整单页控制台（仪表盘/任务/密钥/设置/实测/账号） |
 | API 密钥 | 静态配置 | 可增删改、可限速、可设有效期 |
 | IPv6 XFF | 未支持 | **已实测并支持**，含对照键验证方法与后台开关 |
-| 生成通道 | 走 `showcase` + prompt | 默认走 `plain`（`showcase` 已被上游登录墙拦截） |
+| 生成通道 | 走 `showcase` + prompt | 默认同样是 `showcase` + prompt（实测该通道整段保持首帧图）；`plain` 保留为降级通道 |
 | 提示词 | 始终发送写死的 `DEFAULT_PROMPT` | `prompt` 留空时套用设置里的 `default_prompt`（原先是死配置，从不读取），显式传入优先 |
 | 内容级复读检测 | 无 | `video_sha256` / `duplicate_of`：**输入图不同却拿到相同字节**时标记并写 `WARN`，同图重渲染不误报 |
 | 身份策略 | 同一地址产出两条视频（复用 2 次额度） | **一次生成一个身份**：上游把首帧图与任务绑在身份上，复用会让新请求拿到旧图或旧视频 |

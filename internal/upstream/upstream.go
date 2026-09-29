@@ -251,17 +251,24 @@ func (c *Client) Submit(ctx context.Context, opt SubmitOptions, ident *identity.
 	write := func(k, v string) { _ = mw.WriteField(k, v) }
 	write("visitorId", ident.VisitorID)
 	write("channelCode", "direct")
-	write("sourceHost", hostOf(s.UpstreamBase))
+	write("sourceHost", s.SourceHostValue())
+	// showcase_id is a required field of the showcase endpoint (omitting it is
+	// answered with 400 "Invalid Showcase generation parameters.") and the plain
+	// endpoint ignores unknown fields, so it is always sent — exactly like the
+	// Python original, which posted it unconditionally.
+	write("showcase_id", s.ShowcaseID)
 	write("ratio", ratio)
 	write("duration", strconv.Itoa(duration))
 	write("client_id", ident.ClientID)
-	if s.EndpointMode == config.EndpointShowcase {
-		write("showcase_id", s.ShowcaseID)
+	// The original never omitted `prompt`: an empty caller prompt was replaced by
+	// its built-in default. Mirroring that keeps the field present on every
+	// submission, which is what the showcase channel actually reads.
+	prompt := strings.TrimSpace(opt.Prompt)
+	if prompt == "" {
+		prompt = strings.TrimSpace(s.DefaultPrompt)
 	}
-	// The plain trial channel ignores `prompt` server-side, but sending it is
-	// harmless and keeps the showcase mode working when it is re-enabled.
-	if strings.TrimSpace(opt.Prompt) != "" {
-		write("prompt", opt.Prompt)
+	if prompt != "" {
+		write("prompt", prompt)
 	}
 
 	hdr := make(textproto.MIMEHeader)
@@ -524,14 +531,6 @@ func SniffImageMIME(data []byte) string {
 // ValidImage reports whether the payload sniffs as a supported image.
 func ValidImage(data []byte) bool {
 	return SniffImageMIME(data) != "application/octet-stream"
-}
-
-func hostOf(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return "siftq.com"
-	}
-	return u.Hostname()
 }
 
 func truncate(s string, n int) string {

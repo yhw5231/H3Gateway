@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -27,7 +28,11 @@ import (
 var ErrNotFound = errors.New("not found")
 
 // documentVersion is bumped when the on-disk layout changes.
-const documentVersion = 1
+//
+//  1. initial layout
+//  2. `endpoint_mode: plain` (the v1 default) is repaired to `showcase`; see
+//     migrateSettings.
+const documentVersion = 2
 
 type document struct {
 	Version  int                   `json:"version"`
@@ -103,6 +108,17 @@ func Open(path string, defaults config.Settings) (*Store, error) {
 		}
 		s.probe = doc.Probe
 		s.rebuildOrder()
+		// Repair a document written by an older layout exactly once, then stamp
+		// it with the current version so the repair cannot run again.
+		if doc.Version < documentVersion {
+			if kind, from := migrateSettings(doc.Version, &s.settings); kind != "" {
+				slog.Warn("migrated stored settings",
+					"from_version", doc.Version, "to_version", documentVersion,
+					"setting", kind, "old_value", from, "new_value", "showcase",
+					"reason", "the plain endpoint abandons the uploaded image partway through the clip")
+			}
+			s.dirty = true
+		}
 	case os.IsNotExist(err):
 		// first run
 	default:
@@ -118,6 +134,30 @@ func Open(path string, defaults config.Settings) (*Store, error) {
 
 	go s.flusher()
 	return s, nil
+}
+
+// migrateSettings repairs settings carried over from an older document layout.
+// It returns the name of the setting it changed, plus its previous value, or two
+// empty strings when nothing needed repairing.
+//
+// v1 shipped `endpoint_mode: plain`. Plain is the endpoint that ignores `prompt`
+// and abandons the uploaded picture partway through the clip (measured: the
+// first ~3.5s of a 6.58s render still track the input image, then the inlier
+// count collapses to zero), which is exactly the "the video has nothing to do
+// with my picture" report. Every stored v1 document is therefore moved to
+// showcase — the endpoint the original Python gateway used, which keeps the
+// uploaded first frame for the whole clip. The repair is one-shot: a document is
+// stamped with the current version afterwards, so an operator who deliberately
+// selects plain in the console keeps that choice.
+func migrateSettings(version int, s *config.Settings) (setting, oldValue string) {
+	if version >= documentVersion {
+		return "", ""
+	}
+	if s.EndpointMode == config.EndpointPlain {
+		s.EndpointMode = config.EndpointShowcase
+		return "endpoint_mode", config.EndpointPlain
+	}
+	return "", ""
 }
 
 // Path reports the backing file location.

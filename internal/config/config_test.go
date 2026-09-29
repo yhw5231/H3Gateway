@@ -14,8 +14,11 @@ func TestDefaultSettingsNormalizeKeepsSaneValues(t *testing.T) {
 	if s.MaxConcurrent != 4 {
 		t.Fatalf("max_concurrent = %d", s.MaxConcurrent)
 	}
-	if s.EndpointMode != EndpointPlain {
+	if s.EndpointMode != EndpointShowcase {
 		t.Fatalf("endpoint_mode = %q", s.EndpointMode)
+	}
+	if s.SourceHost != "siftq.com" {
+		t.Fatalf("source_host = %q", s.SourceHost)
 	}
 	if s.XFFMode != XFFAuto {
 		t.Fatalf("xff_mode = %q", s.XFFMode)
@@ -31,6 +34,7 @@ func TestNormalizeRepairsHostileInput(t *testing.T) {
 		TrialBase:        "api/minimax-trial/",
 		EndpointMode:     "nonsense",
 		ShowcaseID:       "   ",
+		SourceHost:       "  ",
 		DefaultPrompt:    "",
 		MaxConcurrent:    -5,
 		SubmitTimeoutSec: 1,
@@ -51,11 +55,14 @@ func TestNormalizeRepairsHostileInput(t *testing.T) {
 	if s.TrialBase != "/api/minimax-trial" {
 		t.Fatalf("trial_base = %q", s.TrialBase)
 	}
-	if s.EndpointMode != EndpointPlain {
+	if s.EndpointMode != EndpointShowcase {
 		t.Fatalf("endpoint_mode = %q", s.EndpointMode)
 	}
 	if s.ShowcaseID == "" || s.DefaultPrompt == "" {
 		t.Fatal("blank showcase id / prompt should fall back to defaults")
+	}
+	if s.SourceHost != "siftq.com" {
+		t.Fatalf("blank source_host should fall back to siftq.com, got %q", s.SourceHost)
 	}
 	if s.MaxConcurrent < 1 {
 		t.Fatalf("max_concurrent = %d", s.MaxConcurrent)
@@ -122,12 +129,36 @@ func TestURLHelpers(t *testing.T) {
 	if got := s.UsageURL(); got != "https://siftq.com/api/minimax-trial/usage" {
 		t.Fatalf("usage url = %q", got)
 	}
+	// showcase is the default: it is the only endpoint that keeps the uploaded
+	// picture for the whole clip.
+	if got := s.GenerateURL(); got != "https://siftq.com/api/minimax-trial/showcase/video-generation" {
+		t.Fatalf("default generate url = %q", got)
+	}
+	s.EndpointMode = EndpointPlain
 	if got := s.GenerateURL(); got != "https://siftq.com/api/minimax-trial/video-generation" {
 		t.Fatalf("plain generate url = %q", got)
 	}
-	s.EndpointMode = EndpointShowcase
-	if got := s.GenerateURL(); got != "https://siftq.com/api/minimax-trial/showcase/video-generation" {
-		t.Fatalf("showcase generate url = %q", got)
+}
+
+func TestSourceHostValue(t *testing.T) {
+	s := DefaultSettings()
+	if got := s.SourceHostValue(); got != "siftq.com" {
+		t.Fatalf("source host = %q", got)
+	}
+	// An explicit value wins, so pointing UpstreamBase at a mirror or a local
+	// mock cannot change what the gateway claims upstream.
+	s.UpstreamBase = "http://127.0.0.1:8791"
+	if got := s.SourceHostValue(); got != "siftq.com" {
+		t.Fatalf("source host must not follow upstream_base, got %q", got)
+	}
+	// With no explicit value it degrades to the upstream host.
+	s.SourceHost = ""
+	if got := s.SourceHostValue(); got != "127.0.0.1:8791" {
+		t.Fatalf("fallback source host = %q", got)
+	}
+	s.UpstreamBase = "https://mirror.example.com/api"
+	if got := s.SourceHostValue(); got != "mirror.example.com" {
+		t.Fatalf("fallback source host = %q", got)
 	}
 }
 
@@ -160,6 +191,7 @@ func TestSettingsFromEnvReadsGatewayVariables(t *testing.T) {
 	t.Setenv("GATEWAY_XFF_VARIANTS", "true")
 	t.Setenv("PROXY_LIST", "socks5://127.0.0.1:1080, http://p:8080")
 	t.Setenv("GATEWAY_ENDPOINT_MODE", "showcase")
+	t.Setenv("GATEWAY_SOURCE_HOST", "siftq.com")
 
 	s := SettingsFromEnv()
 	if s.MaxConcurrent != 7 {

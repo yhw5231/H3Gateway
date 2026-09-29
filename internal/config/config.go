@@ -29,6 +29,7 @@ const (
 	EnvTrialBase    = "GATEWAY_TRIAL_BASE"
 	EnvEndpointMode = "GATEWAY_ENDPOINT_MODE"
 	EnvShowcaseID   = "GATEWAY_SHOWCASE_ID"
+	EnvSourceHost   = "GATEWAY_SOURCE_HOST"
 	EnvDefPrompt    = "GATEWAY_DEFAULT_PROMPT"
 	EnvMaxConc      = "GATEWAY_MAX_CONCURRENT"
 	EnvSubmitTO     = "GATEWAY_SUBMIT_TIMEOUT"
@@ -57,7 +58,7 @@ const (
 var EnvNames = []string{
 	EnvHost, EnvPort, EnvDataDir, EnvDB, EnvVideosDir, EnvUploadsDir,
 	EnvAdminUser, EnvAdminPassword, EnvSessionSecret, EnvLogLevel,
-	EnvUpstream, EnvTrialBase, EnvEndpointMode, EnvShowcaseID, EnvDefPrompt,
+	EnvUpstream, EnvTrialBase, EnvEndpointMode, EnvShowcaseID, EnvSourceHost, EnvDefPrompt,
 	EnvMaxConc, EnvSubmitTO, EnvPollInterval, EnvResubmits, EnvResubmitWait,
 	EnvImageMax, EnvProxyList,
 	EnvXFFMode, EnvXFFVariants, EnvXFFPool,
@@ -66,12 +67,27 @@ var EnvNames = []string{
 }
 
 // Endpoint modes for the anonymous trial channel.
+//
+// Which one is used decides whether the finished clip actually stays on the
+// picture the caller uploaded, so the choice is not cosmetic. Measured against
+// the live service with the same input image and the same prompt:
+//
+//	showcase  the whole 6.58s clip tracks the uploaded first frame
+//	          (ORB+RANSAC inliers 181-208 at every sampled instant)
+//	plain     tracks it for ~3.5s, then abandons it for a fixed showcase
+//	          choreography (inliers collapse 156 -> 65 -> 9 -> 0 and never
+//	          recover) — the "the video has nothing to do with my picture" report.
 const (
 	// EndpointPlain is /video-generation. It is anonymously usable and honours
-	// ratio/duration but ignores `prompt` upstream.
+	// ratio/duration, but it ignores `prompt` and switches to a fixed showcase
+	// choreography partway through the render. Kept as a fallback for the day
+	// showcase is gated again; do not use it when image fidelity matters.
 	EndpointPlain = "plain"
-	// EndpointShowcase is /showcase/video-generation. It used to honour `prompt`,
-	// but upstream now answers it with login_required for anonymous callers.
+	// EndpointShowcase is /showcase/video-generation. It honours `prompt` and
+	// keeps the uploaded first frame for the entire clip. `showcase_id` is a
+	// required field there (omitting it is answered with
+	// 400 "Invalid Showcase generation parameters."). This is the endpoint the
+	// original Python gateway used, and anonymous access works again.
 	EndpointShowcase = "showcase"
 )
 
@@ -121,10 +137,16 @@ type Env struct {
 // Zero values are replaced by DefaultSettings on load, so it is always safe to
 // persist a partial JSON document.
 type Settings struct {
-	UpstreamBase  string `json:"upstream_base"`
-	TrialBase     string `json:"trial_base"`
-	EndpointMode  string `json:"endpoint_mode"`
-	ShowcaseID    string `json:"showcase_id"`
+	UpstreamBase string `json:"upstream_base"`
+	TrialBase    string `json:"trial_base"`
+	EndpointMode string `json:"endpoint_mode"`
+	ShowcaseID   string `json:"showcase_id"`
+	// SourceHost is the `sourceHost` form field. It identifies the originating
+	// site to upstream and is deliberately independent of UpstreamBase: a
+	// deployment that points UpstreamBase at a mirror or a local mock must still
+	// claim to come from the real site, exactly as the Python original did with
+	// its hard-coded "siftq.com".
+	SourceHost    string `json:"source_host"`
 	DefaultPrompt string `json:"default_prompt"`
 	UserAgent     string `json:"user_agent"`
 	Referer       string `json:"referer"`
@@ -154,10 +176,13 @@ type Settings struct {
 // DefaultSettings mirrors the tuned defaults of the Python gateway.
 func DefaultSettings() Settings {
 	return Settings{
-		UpstreamBase:  "https://siftq.com",
-		TrialBase:     "/api/minimax-trial",
-		EndpointMode:  EndpointPlain,
+		UpstreamBase: "https://siftq.com",
+		TrialBase:    "/api/minimax-trial",
+		// showcase is the original project's endpoint and the only one that keeps
+		// the uploaded picture for the whole clip; see the Endpoint* comments.
+		EndpointMode:  EndpointShowcase,
 		ShowcaseID:    "case-mtqzygu8",
+		SourceHost:    "siftq.com",
 		DefaultPrompt: "Animate the input image with natural, faithful motion. Keep the subject, appearance, clothing and setting exactly as in the image; never replace the subject with a person, and never add people or gestures that are not present in the image.",
 		UserAgent:     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 		Referer:       "https://siftq.com/minimax-h3/try/zh",
@@ -202,6 +227,10 @@ func (s *Settings) Normalize() {
 	if strings.TrimSpace(s.ShowcaseID) == "" {
 		s.ShowcaseID = d.ShowcaseID
 	}
+	if strings.TrimSpace(s.SourceHost) == "" {
+		s.SourceHost = d.SourceHost
+	}
+	s.SourceHost = strings.TrimSpace(s.SourceHost)
 	if strings.TrimSpace(s.DefaultPrompt) == "" {
 		s.DefaultPrompt = d.DefaultPrompt
 	}
@@ -301,6 +330,27 @@ func (s Settings) GenerateURL() string {
 // UsageURL returns the anonymous quota endpoint.
 func (s Settings) UsageURL() string { return s.TrialURL("/usage") }
 
+// SourceHostValue returns the `sourceHost` form field sent upstream. It falls
+// back to the host of UpstreamBase only when no explicit value is configured, so
+// a deployment pointing at a mirror still announces the real originating site.
+func (s Settings) SourceHostValue() string {
+	if h := strings.TrimSpace(s.SourceHost); h != "" {
+		return h
+	}
+	base := s.UpstreamBase
+	if i := strings.Index(base, "://"); i >= 0 {
+		base = base[i+3:]
+	}
+	if i := strings.IndexAny(base, "/?#"); i >= 0 {
+		base = base[:i]
+	}
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return "siftq.com"
+	}
+	return base
+}
+
 // LoadEnv reads the process environment. It never fails: unusable values fall
 // back to defaults so a container with a typo still starts and reports the
 // problem through the admin console.
@@ -332,6 +382,7 @@ func SettingsFromEnv() Settings {
 	s.TrialBase = envStr(EnvTrialBase, s.TrialBase)
 	s.EndpointMode = envStr(EnvEndpointMode, s.EndpointMode)
 	s.ShowcaseID = envStr(EnvShowcaseID, s.ShowcaseID)
+	s.SourceHost = envStr(EnvSourceHost, s.SourceHost)
 	s.DefaultPrompt = envStr(EnvDefPrompt, s.DefaultPrompt)
 	s.MaxConcurrent = envInt(EnvMaxConc, s.MaxConcurrent)
 	s.SubmitTimeoutSec = envInt(EnvSubmitTO, s.SubmitTimeoutSec)

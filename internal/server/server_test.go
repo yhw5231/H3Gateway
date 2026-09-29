@@ -30,6 +30,14 @@ var jpegBytes = []byte{0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0
 
 const adminPassword = "admin"
 
+// serveGenerationOnBothPaths registers a generation handler for the plain and
+// the showcase endpoint alike, mirroring the real service, which serves the
+// same trial API under both prefixes. The gateway defaults to showcase.
+func serveGenerationOnBothPaths(mux *http.ServeMux, h http.HandlerFunc) {
+	mux.HandleFunc("/api/minimax-trial/video-generation", h)
+	mux.HandleFunc("/api/minimax-trial/showcase/video-generation", h)
+}
+
 // fakeUpstream answers the trial endpoints so the whole HTTP surface can be
 // exercised without touching the network.
 func fakeUpstreamHandler() http.Handler {
@@ -37,7 +45,7 @@ func fakeUpstreamHandler() http.Handler {
 	mux.HandleFunc("/api/minimax-trial/usage", func(w http.ResponseWriter, r *http.Request) {
 		writeTestJSON(w, map[string]any{"enabled": true, "limit": 2, "used": 0, "remaining": 2, "max_concurrent": 5})
 	})
-	mux.HandleFunc("/api/minimax-trial/video-generation", func(w http.ResponseWriter, r *http.Request) {
+	serveGenerationOnBothPaths(mux, func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseMultipartForm(8 << 20)
 		writeTestJSON(w, map[string]any{
 			"task_id": "up-1", "access_token": "tok", "status": "queued",

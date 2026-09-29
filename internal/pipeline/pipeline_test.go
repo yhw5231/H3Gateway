@@ -28,6 +28,17 @@ import (
 // upstream validates.
 var jpegBytes = []byte{0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00}
 
+// serveGenerationOnBothPaths registers a generation handler for the plain and
+// the showcase endpoint alike, mirroring the real service, which serves the
+// same trial API under both prefixes. The gateway's default endpoint is
+// showcase — the only one that keeps the uploaded picture for the whole clip —
+// so a fixture that only knew the plain path would silently stop exercising the
+// code under test.
+func serveGenerationOnBothPaths(mux *http.ServeMux, h http.HandlerFunc) {
+	mux.HandleFunc("/api/minimax-trial/video-generation", h)
+	mux.HandleFunc("/api/minimax-trial/showcase/video-generation", h)
+}
+
 // fakeTrial is a scriptable stand-in for the upstream trial channel.
 type fakeTrial struct {
 	mu sync.Mutex
@@ -64,7 +75,7 @@ type fakeTrial struct {
 func (f *fakeTrial) handler() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/api/minimax-trial/video-generation", func(w http.ResponseWriter, r *http.Request) {
+	serveGenerationOnBothPaths(mux, func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseMultipartForm(8 << 20); err != nil {
 			http.Error(w, "bad form", http.StatusBadRequest)
 			return
@@ -830,7 +841,7 @@ func newReplayTrial(alwaysSame bool) *replayTrial {
 func (f *replayTrial) handler() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/api/minimax-trial/video-generation", func(w http.ResponseWriter, r *http.Request) {
+	serveGenerationOnBothPaths(mux, func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseMultipartForm(8 << 20); err != nil {
 			http.Error(w, "bad form", http.StatusBadRequest)
 			return
@@ -1052,7 +1063,7 @@ func newBoundImageTrial() *boundImageTrial {
 func (f *boundImageTrial) handler() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/api/minimax-trial/video-generation", func(w http.ResponseWriter, r *http.Request) {
+	serveGenerationOnBothPaths(mux, func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseMultipartForm(8 << 20); err != nil {
 			http.Error(w, "bad form", http.StatusBadRequest)
 			return
@@ -1254,7 +1265,7 @@ type stickyContentTrial struct {
 func (f *stickyContentTrial) handler() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/api/minimax-trial/video-generation", func(w http.ResponseWriter, r *http.Request) {
+	serveGenerationOnBothPaths(mux, func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseMultipartForm(8 << 20); err != nil {
 			http.Error(w, "bad form", http.StatusBadRequest)
 			return
