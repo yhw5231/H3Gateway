@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yhw5231/H3Gateway/internal/auth"
 	"github.com/yhw5231/H3Gateway/internal/config"
 	"github.com/yhw5231/H3Gateway/internal/identity"
 )
@@ -210,7 +211,20 @@ type SubmitOptions struct {
 	Prompt   string
 	Ratio    string
 	Duration int
+
+	// IdempotencyKey identifies one logical generation. It must be unique per
+	// generation: upstream answers a repeated key by replaying the task it
+	// created the first time, which would hand the caller an older video. When
+	// empty, a fresh key is minted per request.
+	IdempotencyKey string
 }
+
+// NewIdempotencyKey mints the value for the Idempotency-Key request header.
+//
+// It is deliberately *not* derived from the identity: one forged address is
+// reused for its second free generation, so an identity-derived key would make
+// two different generations look like the same request.
+func NewIdempotencyKey() string { return "mmtrial_" + auth.GenerateID() }
 
 // Submit posts an image and returns the accepted upstream task.
 func (c *Client) Submit(ctx context.Context, opt SubmitOptions, ident *identity.Identity, proxy string) (*SubmitResult, error) {
@@ -272,7 +286,11 @@ func (c *Client) Submit(ctx context.Context, opt SubmitOptions, ident *identity.
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-	req.Header.Set("Idempotency-Key", ident.ClientID)
+	idempotencyKey := strings.TrimSpace(opt.IdempotencyKey)
+	if idempotencyKey == "" {
+		idempotencyKey = NewIdempotencyKey()
+	}
+	req.Header.Set("Idempotency-Key", idempotencyKey)
 
 	raw, err := c.do(c.httpClient(proxy), req)
 	if err != nil {

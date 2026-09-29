@@ -221,9 +221,9 @@ function renderDashStats(d) {
     { k: "进行中", v: (by.queued || 0) + (by.running || 0), s: `队列 ${by.queued || 0} · 生成 ${by.running || 0}`, cls: "warn" },
     { k: "失败", v: by.failed || 0, s: "failed", cls: (by.failed || 0) > 0 ? "bad" : "" },
     { k: "有效密钥", v: t.active_api_keys || 0, s: `共 ${t.api_keys || 0} 个` },
-    { k: "已铸身份", v: r.identities_minted || 0, s: `耗尽 ${r.identities_exhausted || 0} · 复用 ${r.identities_reused || 0}` },
+    { k: "已铸身份", v: r.identities_minted || 0, s: `退役 ${r.identities_exhausted || 0}` },
     { k: "在飞请求", v: p.in_flight || 0, s: `并发上限 ${p.max_concurrent || 0}` },
-    { k: "上游并发", v: r.pool_ready || 0, s: "身份池可用数" },
+    { k: "身份策略", v: "1 : 1", s: "每次生成独立身份" },
   ];
   $("#dash-stats").innerHTML = cards.map((c) =>
     `<div class="stat ${c.cls || ""}"><div class="k">${esc(c.k)}</div><div class="v">${esc(c.v)}</div><div class="s">${esc(c.s)}</div></div>`

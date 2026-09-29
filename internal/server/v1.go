@@ -193,6 +193,10 @@ func (s *Server) writeSubmitError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, pipeline.ErrImageRejected):
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_image")
+	case errors.Is(err, pipeline.ErrUpstreamReplay):
+		// Upstream kept handing back a task the caller already has; returning it
+		// would silently serve an old video, so surface the failure instead.
+		writeOpenAIError(w, http.StatusBadGateway, err.Error(), "upstream_replay")
 	case errors.Is(err, pipeline.ErrUpstreamBusy):
 		writeOpenAIError(w, http.StatusBadGateway, err.Error(), "upstream_unavailable")
 	default:

@@ -27,6 +27,15 @@ import (
 // ErrUpstreamBusy means the submit window closed without success.
 var ErrUpstreamBusy = errors.New("upstream submit failed")
 
+// ErrUpstreamReplay means upstream kept answering with a task it had already
+// created for an earlier submission. Accepting it would deliver a video the
+// caller has already been given, so the gateway fails loudly instead.
+var ErrUpstreamReplay = errors.New("upstream replayed an earlier task")
+
+// maxSubmitReplays bounds how many times one submission may rotate away from a
+// replayed upstream task before it is reported as a failure.
+const maxSubmitReplays = 5
+
 // ErrImageRejected means the payload is not a usable image.
 var ErrImageRejected = errors.New("image rejected")
 
@@ -208,36 +217,51 @@ func (p *Pipeline) Submit(ctx context.Context, req SubmitRequest) (*model.Task, 
 	deadline := time.Now().Add(settings.SubmitTimeout())
 	var lastErr error
 	authFails := 0
+	replays := 0
+	// One key per logical generation. Retries of this same submission are then
+	// deduplicated upstream, while the next generation always carries a fresh key
+	// and therefore can never be answered with the previous video.
+	idemKey := upstream.NewIdempotencyKey()
 
 	for attempt := 1; time.Now().Before(deadline); attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		ident := p.rot.Acquire(family, poolPolicy, settings.XFFVariants)
+		ident := p.rot.Mint(family, poolPolicy, settings.XFFVariants)
 		proxy := p.up.PickProxy()
 		res, err := p.up.Submit(ctx, upstream.SubmitOptions{
-			Image:    req.Image,
-			Filename: req.Filename,
-			Prompt:   req.Prompt,
-			Ratio:    req.Ratio,
-			Duration: req.Duration,
+			Image:          req.Image,
+			Filename:       req.Filename,
+			Prompt:         req.Prompt,
+			Ratio:          req.Ratio,
+			Duration:       req.Duration,
+			IdempotencyKey: idemKey,
 		}, ident, proxy)
 
+		// The identity served its one attempt and is never handed out again:
+		// upstream associates the uploaded image and the created task with it, so
+		// recycling it would let a later request answer with this image or this
+		// video. Failed attempts retire it too — forged addresses are unlimited.
+		p.rot.Retire(ident)
+
 		if err == nil {
-			switch {
-			case res.RemainingKnown && res.Remaining <= 0:
-				// Upstream says this address is spent.
-				p.rot.Burn(ident)
-			case res.RemainingKnown:
-				// Upstream reports the authoritative remaining count, so adopt it
-				// and return the identity without decrementing a second time —
-				// doing both would retire an address that still has a use left
-				// and halve the effective capacity.
-				ident.UsesLeft = res.Remaining
-				p.rot.Report(ident, false)
-			default:
-				// No remaining field: fall back to local accounting.
-				p.rot.Report(ident, true)
+			if owner, ok := p.store.TaskByUpstreamID(res.TaskID); ok {
+				// Upstream handed back a task it had already created — either it
+				// replayed an earlier submission or a spent address returned its
+				// last task. Adopting it would make this generation serve a video
+				// the caller already has, so switch to a brand new idempotency key
+				// and try again with a fresh identity.
+				replays++
+				p.log.Warn("upstream returned an already-known task; rotating",
+					"upstream", res.TaskID, "existing_task", owner.ID,
+					"xff", ident.ForgedIP, "attempt", attempt)
+				if replays >= maxSubmitReplays {
+					return nil, fmt.Errorf("%w: task %s already belongs to %s",
+						ErrUpstreamReplay, res.TaskID, owner.ID)
+				}
+				idemKey = upstream.NewIdempotencyKey()
+				sleepCtx(ctx, jitter(400*time.Millisecond, 800*time.Millisecond))
+				continue
 			}
 			task := p.newTask(req, ident, res, proxy, settings)
 			p.store.SaveTask(task)
@@ -258,8 +282,7 @@ func (p *Pipeline) Submit(ctx context.Context, req SubmitRequest) (*model.Task, 
 
 		switch {
 		case ue.IsRateLimit():
-			// This forged address is spent; discard it and mint a new identity.
-			p.rot.Burn(ident)
+			// This forged address is spent; the next attempt mints a new identity.
 			p.log.Debug("quota exhausted for identity, rotating",
 				"xff", ident.ForgedIP, "attempt", attempt)
 			sleepCtx(ctx, jitter(400*time.Millisecond, 800*time.Millisecond))
@@ -268,7 +291,6 @@ func (p *Pipeline) Submit(ctx context.Context, req SubmitRequest) (*model.Task, 
 		case ue.IsAuthGate():
 			// Upstream occasionally gates a single identity. Rotating usually
 			// clears it; a run of failures means a policy change, not bad luck.
-			p.rot.Burn(ident)
 			authFails++
 			if authFails >= 6 {
 				return nil, fmt.Errorf("upstream refused every fresh identity (%s); the anonymous channel appears gated: %w", ue.Code, ue)
@@ -278,7 +300,6 @@ func (p *Pipeline) Submit(ctx context.Context, req SubmitRequest) (*model.Task, 
 			continue
 
 		case ue.IsRetryable():
-			p.rot.Report(ident, false)
 			backoff := time.Duration(minInt(2000*attempt, 8000)) * time.Millisecond
 			p.log.Debug("transient upstream error, backing off", "err", ue.Error(), "backoff", backoff)
 			sleepCtx(ctx, backoff)
@@ -286,7 +307,6 @@ func (p *Pipeline) Submit(ctx context.Context, req SubmitRequest) (*model.Task, 
 
 		default:
 			// A 4xx means the request itself is wrong; retrying cannot help.
-			p.rot.Report(ident, false)
 			return nil, ue
 		}
 	}
@@ -466,39 +486,56 @@ func (p *Pipeline) resubmit(ctx context.Context, t *model.Task) bool {
 	}
 	settings := p.store.Settings()
 	effective := identity.EffectiveMode(settings, p.probeFn())
-	ident := p.rot.Mint(identity.PickFamily(effective), PoolPolicy(settings), settings.XFFVariants)
-	proxy := p.up.PickProxy()
 
-	res, err := p.up.Submit(ctx, upstream.SubmitOptions{
-		Image:    data,
-		Filename: t.ID + ".jpg",
-		Prompt:   t.Prompt,
-		Ratio:    t.Ratio,
-		Duration: t.Duration,
-	}, ident, proxy)
-	if err != nil {
-		p.log.Warn("resubmit failed", "task", t.ID, "err", err)
-		t.Error = "resubmit failed: " + err.Error()
-		return false
+	// Upstream can answer a resubmit with a task it already created (including
+	// the dead one being replaced). Adopting that id would point this task at
+	// somebody else's video, so rotate and try again.
+	for attempt := 0; attempt < 3; attempt++ {
+		ident := p.rot.Mint(identity.PickFamily(effective), PoolPolicy(settings), settings.XFFVariants)
+		proxy := p.up.PickProxy()
+
+		res, err := p.up.Submit(ctx, upstream.SubmitOptions{
+			Image:          data,
+			Filename:       t.ID + ".jpg",
+			Prompt:         t.Prompt,
+			Ratio:          t.Ratio,
+			Duration:       t.Duration,
+			IdempotencyKey: upstream.NewIdempotencyKey(),
+		}, ident, proxy)
+		// One attempt per identity, exactly like Submit.
+		p.rot.Retire(ident)
+		if err != nil {
+			p.log.Warn("resubmit failed", "task", t.ID, "err", err)
+			t.Error = "resubmit failed: " + err.Error()
+			return false
+		}
+		if owner, ok := p.store.TaskByUpstreamID(res.TaskID); ok {
+			p.log.Warn("resubmit answered with an already-known task; rotating",
+				"task", t.ID, "upstream", res.TaskID, "existing_task", owner.ID, "attempt", attempt+1)
+			continue
+		}
+
+		t.UpstreamTaskID = res.TaskID
+		t.AccessToken = res.AccessToken
+		t.ClientID = ident.ClientID
+		t.VisitorID = ident.VisitorID
+		t.IPFamily = ident.Family
+		t.ForgedIP = ""
+		if proxy == "" {
+			t.ForgedIP = ident.ForgedIP
+		}
+		t.Attempts++
+		t.Status = model.StatusQueued
+		t.Error = ""
+		t.UpdatedAt = time.Now()
+		p.store.SaveTask(t)
+		p.log.Info("resubmitted under a fresh identity", "task", t.ID,
+			"upstream", res.TaskID, "attempt", t.Attempts, "xff", ident.ForgedIP)
+		return true
 	}
 
-	t.UpstreamTaskID = res.TaskID
-	t.AccessToken = res.AccessToken
-	t.ClientID = ident.ClientID
-	t.VisitorID = ident.VisitorID
-	t.IPFamily = ident.Family
-	t.ForgedIP = ""
-	if proxy == "" {
-		t.ForgedIP = ident.ForgedIP
-	}
-	t.Attempts++
-	t.Status = model.StatusQueued
-	t.Error = ""
-	t.UpdatedAt = time.Now()
-	p.store.SaveTask(t)
-	p.log.Info("resubmitted under a fresh identity", "task", t.ID,
-		"upstream", res.TaskID, "attempt", t.Attempts, "xff", ident.ForgedIP)
-	return true
+	t.Error = "upstream kept replaying an already-used task"
+	return false
 }
 
 func (p *Pipeline) finish(t *model.Task, status, msg string) {

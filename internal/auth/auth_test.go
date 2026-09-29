@@ -123,9 +123,23 @@ func TestSessionRejectsTamperingAndWrongSecret(t *testing.T) {
 	if _, err := VerifySession(secret, "garbage"); err == nil {
 		t.Fatal("a malformed token was accepted")
 	}
-	// Flipping a byte inside the payload must invalidate the signature.
+	// Flipping a byte inside the payload must invalidate the signature. Mutate the
+	// decoded payload and re-encode it: the signature covers the decoded bytes, so
+	// editing the base64 text is not enough — depending on where the payload ends,
+	// the last character's unused bits can decode to the very same bytes and the
+	// "tampered" token would still be accepted. The flipped byte sits in the
+	// trailing random id, so everything else still parses: only the signature can
+	// reject it.
 	parts := strings.SplitN(token, ".", 2)
-	mutated := parts[0][:len(parts[0])-1] + "A" + "." + parts[1]
+	raw, err := unb64(parts[0])
+	if err != nil {
+		t.Fatalf("cannot decode the payload of our own token: %v", err)
+	}
+	raw[len(raw)-1] ^= 0x01
+	mutated := b64(raw) + "." + parts[1]
+	if mutated == token {
+		t.Fatal("the mutation did not change the token")
+	}
 	if _, err := VerifySession(secret, mutated); err == nil {
 		t.Fatal("a mutated payload was accepted")
 	}

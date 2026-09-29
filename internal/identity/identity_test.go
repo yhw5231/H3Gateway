@@ -138,46 +138,31 @@ func TestMintProducesUniqueIdentities(t *testing.T) {
 	}
 }
 
-func TestRotatorRecyclesUntilExhausted(t *testing.T) {
+func TestRotatorNeverReusesAnIdentity(t *testing.T) {
 	r := NewRotator()
-	// Each forged address is worth two generations, so the same identity must
-	// come back once before it is retired.
-	first := r.Acquire(model.FamilyIPv4, PoolPublic, false)
-	r.Report(first, true) // one use left -> returns to the pool
-
-	second := r.Acquire(model.FamilyIPv4, PoolPublic, false)
-	if second.ClientID != first.ClientID {
-		t.Fatal("expected the pooled identity to be reused while it still has quota")
+	seen := map[string]bool{}
+	for i := 0; i < 20; i++ {
+		id := r.Mint(model.FamilyIPv4, PoolPublic, false)
+		if seen[id.ClientID] || seen[id.ForgedIP] {
+			t.Fatalf("iteration %d reused an identity: %+v", i, id)
+		}
+		seen[id.ClientID] = true
+		seen[id.ForgedIP] = true
+		r.Retire(id)
 	}
-	r.Report(second, true) // exhausted -> retired
-
-	third := r.Acquire(model.FamilyIPv4, PoolPublic, false)
-	if third.ClientID == first.ClientID {
-		t.Fatal("expected a fresh identity once the pooled one was spent")
-	}
-
 	st := r.Stats()
-	if st.IdentitiesMinted != 2 {
-		t.Fatalf("minted = %d, want 2", st.IdentitiesMinted)
-	}
-	if st.IdentitiesReused != 1 {
-		t.Fatalf("reused = %d, want 1", st.IdentitiesReused)
-	}
-	if st.IdentitiesExhausted != 1 {
-		t.Fatalf("exhausted = %d, want 1", st.IdentitiesExhausted)
+	if st.IdentitiesMinted != 20 || st.IdentitiesExhausted != 20 {
+		t.Fatalf("stats = %+v, want 20 minted and 20 retired", st)
 	}
 }
 
-func TestRotatorBurnRetiresImmediately(t *testing.T) {
+func TestRotatorResetClearsCounters(t *testing.T) {
 	r := NewRotator()
-	id := r.Acquire(model.FamilyIPv6, PoolPublic, false)
-	r.Burn(id)
-	next := r.Acquire(model.FamilyIPv6, PoolPublic, false)
-	if next.ClientID == id.ClientID {
-		t.Fatal("a burned identity must not be handed out again")
-	}
-	if st := r.Stats(); st.IdentitiesExhausted != 1 {
-		t.Fatalf("exhausted = %d, want 1", st.IdentitiesExhausted)
+	id := r.Mint(model.FamilyIPv6, PoolPublic, false)
+	r.Retire(id)
+	r.Reset()
+	if st := r.Stats(); st.IdentitiesMinted != 0 || st.IdentitiesExhausted != 0 {
+		t.Fatalf("stats survived Reset: %+v", st)
 	}
 }
 

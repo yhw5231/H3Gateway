@@ -118,6 +118,28 @@ func TestPendingTasksOnlyReturnsResumableWork(t *testing.T) {
 	}
 }
 
+func TestTaskByUpstreamID(t *testing.T) {
+	st := newTestStore(t)
+	first := mkTask("video_a", model.StatusSucceeded)
+	first.UpstreamTaskID = "up-1"
+	st.SaveTask(first)
+
+	second := mkTask("video_b", model.StatusQueued)
+	second.UpstreamTaskID = "up-2"
+	st.SaveTask(second)
+
+	got, ok := st.TaskByUpstreamID("up-2")
+	if !ok || got.ID != "video_b" {
+		t.Fatalf("TaskByUpstreamID(up-2) = %+v, %v", got, ok)
+	}
+	if _, ok := st.TaskByUpstreamID("up-unknown"); ok {
+		t.Fatal("an unknown upstream id must not match")
+	}
+	if _, ok := st.TaskByUpstreamID(""); ok {
+		t.Fatal("an empty upstream id must not match")
+	}
+}
+
 func TestDeleteTask(t *testing.T) {
 	st := newTestStore(t)
 	st.SaveTask(mkTask("video_x", model.StatusQueued))

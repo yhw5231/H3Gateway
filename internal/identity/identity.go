@@ -303,37 +303,25 @@ func fallbackIPv4() string { return "192.0.2.1" }
 // rotator
 // ---------------------------------------------------------------------------
 
-// Rotator mints and recycles identities. Each forged address is worth two
-// generations per day upstream, so an exhausted address is simply dropped.
+// Rotator mints the throw-away identities used to talk to upstream.
+//
+// Identities are never recycled. Upstream ties the uploaded image and the task
+// it creates to the identity that submitted them, so a reused identity makes a
+// later generation answer with the earlier image ("changing the picture makes no
+// difference") or hand back the earlier task ("the next request returns the
+// previous video"). Forged addresses are effectively unlimited — IPv6 alone
+// offers ~2^61 usable values — so reusing one buys nothing and risks exactly
+// those two failures.
 type Rotator struct {
 	mu        sync.Mutex
-	pool      []*Identity
 	minted    int64
 	exhausted int64
-	reused    int64
 }
 
 // NewRotator returns an empty rotator.
 func NewRotator() *Rotator { return &Rotator{} }
 
-// Acquire returns a pooled identity that still has quota, or mints a new one.
-func (r *Rotator) Acquire(family, poolPolicy string, variants bool) *Identity {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for len(r.pool) > 0 {
-		id := r.pool[len(r.pool)-1]
-		r.pool = r.pool[:len(r.pool)-1]
-		if id.UsesLeft > 0 {
-			r.reused++
-			return id
-		}
-		r.exhausted++
-	}
-	r.minted++
-	return Mint(family, poolPolicy, variants)
-}
-
-// Mint creates an identity outside the pool and counts it.
+// Mint creates a fresh identity and counts it.
 func (r *Rotator) Mint(family, poolPolicy string, variants bool) *Identity {
 	r.mu.Lock()
 	r.minted++
@@ -341,28 +329,9 @@ func (r *Rotator) Mint(family, poolPolicy string, variants bool) *Identity {
 	return Mint(family, poolPolicy, variants)
 }
 
-// Report returns an identity to the pool or retires it.
-func (r *Rotator) Report(id *Identity, consumed bool) {
-	if id == nil {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if consumed {
-		id.UsesLeft--
-	}
-	if id.UsesLeft > 0 {
-		// Cap the pool so a long-running process cannot accumulate identities.
-		if len(r.pool) < 256 {
-			r.pool = append(r.pool, id)
-		}
-	} else {
-		r.exhausted++
-	}
-}
-
-// Burn retires an identity immediately, used when upstream rejects it.
-func (r *Rotator) Burn(id *Identity) {
+// Retire marks an identity as spent. Identities are retired after the single
+// generation they were minted for, and immediately when upstream rejects them.
+func (r *Rotator) Retire(id *Identity) {
 	if id == nil {
 		return
 	}
@@ -376,8 +345,6 @@ func (r *Rotator) Burn(id *Identity) {
 type Stats struct {
 	IdentitiesMinted    int64  `json:"identities_minted"`
 	IdentitiesExhausted int64  `json:"identities_exhausted"`
-	IdentitiesReused    int64  `json:"identities_reused"`
-	PoolReady           int    `json:"pool_ready"`
 	ProxyMode           bool   `json:"proxy_mode"`
 	EffectiveXFFMode    string `json:"effective_xff_mode"`
 	ForgedHeaderSent    bool   `json:"forged_header_sent"`
@@ -390,20 +357,15 @@ func (r *Rotator) Stats() Stats {
 	return Stats{
 		IdentitiesMinted:    r.minted,
 		IdentitiesExhausted: r.exhausted,
-		IdentitiesReused:    r.reused,
-		PoolReady:           len(r.pool),
 	}
 }
 
-// Reset clears the identity pool and the lifetime counters, used by the admin
-// console.
+// Reset clears the lifetime counters, used by the admin console.
 func (r *Rotator) Reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.pool = nil
 	r.minted = 0
 	r.exhausted = 0
-	r.reused = 0
 }
 
 // ---------------------------------------------------------------------------

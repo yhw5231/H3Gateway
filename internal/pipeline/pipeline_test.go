@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -160,7 +161,14 @@ func newHarness(t *testing.T, mutate func(*config.Settings), fake *fakeTrial) *h
 	}
 	srv := httptest.NewServer(fake.handler())
 	t.Cleanup(srv.Close)
+	h := newHarnessOn(t, srv, mutate)
+	h.fake = fake
+	return h
+}
 
+// newHarnessOn wires a pipeline against an already running stand-in upstream.
+func newHarnessOn(t *testing.T, srv *httptest.Server, mutate func(*config.Settings)) *harness {
+	t.Helper()
 	dir := t.TempDir()
 	settings := config.DefaultSettings()
 	settings.UpstreamBase = srv.URL
@@ -191,7 +199,7 @@ func newHarness(t *testing.T, mutate func(*config.Settings), fake *fakeTrial) *h
 	pipe.Start(ctx)
 	t.Cleanup(func() { cancel(); pipe.Stop() })
 
-	return &harness{pipe: pipe, store: st, fake: fake, srv: srv, videos: videos, uploads: uploads}
+	return &harness{pipe: pipe, store: st, srv: srv, videos: videos, uploads: uploads}
 }
 
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool) bool {
@@ -423,72 +431,60 @@ func TestSubmitPollsToSuccessAndCachesVideo(t *testing.T) {
 	}
 }
 
-func TestSuccessfulSubmitKeepsTheSecondUseOfAnAddress(t *testing.T) {
-	// Upstream allows two generations per forged address. After the first one
-	// succeeds with remaining=1, the identity must go back to the pool instead of
-	// being retired, otherwise half of every address is thrown away.
+func TestEachGenerationGetsItsOwnIdentity(t *testing.T) {
+	// Upstream ties the uploaded image and the created task to the identity that
+	// submitted them, so a second generation must never reuse the first one's
+	// forged address, client id or visitor id — otherwise the new request answers
+	// with the previous image or the previous video.
 	h := newHarness(t, func(s *config.Settings) { s.XFFMode = config.XFFIPv4 }, nil)
 
-	first, err := h.pipe.Submit(context.Background(), SubmitRequest{Image: jpegBytes, Filename: "r.jpg"})
-	if err != nil {
-		t.Fatalf("first submit: %v", err)
+	var ids []string
+	var xffs []string
+	for i := 0; i < 3; i++ {
+		task, err := h.pipe.Submit(context.Background(), SubmitRequest{Image: jpegBytes, Filename: "r.jpg"})
+		if err != nil {
+			t.Fatalf("submit %d: %v", i+1, err)
+		}
+		settle(t, h, task.ID)
+		cur, _ := h.store.GetTask(task.ID)
+		ids = append(ids, cur.ClientID)
+		xffs = append(xffs, cur.ForgedIP)
 	}
-	if !waitFor(t, 15*time.Second, func() bool {
-		cur, ok := h.store.GetTask(first.ID)
-		return ok && cur.Terminal()
-	}) {
-		t.Fatal("first task never settled")
+
+	for i := 1; i < len(ids); i++ {
+		if ids[i] == ids[i-1] {
+			t.Fatalf("generation %d reused client id %q", i+1, ids[i])
+		}
+		if xffs[i] == xffs[i-1] {
+			t.Fatalf("generation %d reused forged address %q", i+1, xffs[i])
+		}
 	}
 
 	st := h.pipe.Rotator().Stats()
-	if st.IdentitiesExhausted != 0 {
-		t.Fatalf("an address with one use left was retired: %+v", st)
-	}
-	if st.PoolReady != 1 {
-		t.Fatalf("expected the identity to be pooled, stats = %+v", st)
-	}
-
-	second, err := h.pipe.Submit(context.Background(), SubmitRequest{Image: jpegBytes, Filename: "r.jpg"})
-	if err != nil {
-		t.Fatalf("second submit: %v", err)
-	}
-	if second.ForgedIP != first.ForgedIP {
-		t.Fatalf("expected the pooled address %q to be reused, got %q", first.ForgedIP, second.ForgedIP)
-	}
-	if st := h.pipe.Rotator().Stats(); st.IdentitiesReused != 1 {
-		t.Fatalf("reuse not recorded: %+v", st)
+	if st.IdentitiesMinted != 3 || st.IdentitiesExhausted != 3 {
+		t.Fatalf("every generation must mint and retire one identity: %+v", st)
 	}
 }
 
-func TestSuccessfulSubmitRetiresAnAddressWithNoQuotaLeft(t *testing.T) {
-	// When upstream answers remaining=0 the address must be dropped immediately.
-	fake := &fakeTrial{videoBody: []byte("MP4"), submitRemaining: -1}
-	h := newHarness(t, func(s *config.Settings) { s.XFFMode = config.XFFIPv4 }, fake)
-
-	if _, err := h.pipe.Submit(context.Background(), SubmitRequest{Image: jpegBytes, Filename: "r.jpg"}); err != nil {
-		t.Fatalf("submit: %v", err)
-	}
-	st := h.pipe.Rotator().Stats()
-	if st.IdentitiesExhausted != 1 {
-		t.Fatalf("expected the spent address to be retired: %+v", st)
-	}
-	if st.PoolReady != 0 {
-		t.Fatalf("a spent address must not be pooled: %+v", st)
-	}
-}
-
-func TestSuccessfulSubmitWithoutRemainingUsesLocalAccounting(t *testing.T) {
-	// Some upstream answers omit "remaining"; the local counter must then be the
-	// source of truth so the address is still reused once.
-	fake := &fakeTrial{videoBody: []byte("MP4"), omitRemaining: true}
-	h := newHarness(t, func(s *config.Settings) { s.XFFMode = config.XFFIPv4 }, fake)
-
-	if _, err := h.pipe.Submit(context.Background(), SubmitRequest{Image: jpegBytes, Filename: "r.jpg"}); err != nil {
-		t.Fatalf("submit: %v", err)
-	}
-	st := h.pipe.Rotator().Stats()
-	if st.IdentitiesExhausted != 0 || st.PoolReady != 1 {
-		t.Fatalf("local accounting should keep one use: %+v", st)
+func TestSuccessfulSubmitRetiresTheAddress(t *testing.T) {
+	// Whatever upstream reports about the remaining quota, the address served its
+	// generation and is dropped: recycling it would risk answering a later
+	// request with this image or this video.
+	for name, fake := range map[string]*fakeTrial{
+		"remaining=1":      {videoBody: []byte("MP4"), submitRemaining: 1},
+		"remaining=0":      {videoBody: []byte("MP4"), submitRemaining: -1},
+		"remaining absent": {videoBody: []byte("MP4"), omitRemaining: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, func(s *config.Settings) { s.XFFMode = config.XFFIPv4 }, fake)
+			if _, err := h.pipe.Submit(context.Background(), SubmitRequest{Image: jpegBytes, Filename: "r.jpg"}); err != nil {
+				t.Fatalf("submit: %v", err)
+			}
+			st := h.pipe.Rotator().Stats()
+			if st.IdentitiesMinted != 1 || st.IdentitiesExhausted != 1 {
+				t.Fatalf("address not retired after use: %+v", st)
+			}
+		})
 	}
 }
 
@@ -792,4 +788,357 @@ func TestConcurrentSubmitsRespectTheLimit(t *testing.T) {
 func fileExists(path string) bool {
 	st, err := os.Stat(path)
 	return err == nil && !st.IsDir()
+}
+
+// ---------------------------------------------------------------------------
+// upstream task replay
+// ---------------------------------------------------------------------------
+
+// replayTrial models an upstream that answers a fresh submission with a task it
+// already created. Two flavours are covered:
+//
+//   - a spent quota key that hands back the last task it produced instead of a
+//     429 (replayedOnce), and
+//   - an upstream that always answers with the same task (alwaysSame).
+//
+// In both cases the reported quota never drops, so the gateway keeps reusing the
+// same forged address 鈥?which is exactly the combination that used to make a new
+// generation serve an older video.
+type replayTrial struct {
+	mu sync.Mutex
+
+	uses  map[string]int
+	last  map[string]string
+	tasks map[string]string
+	seq   int
+
+	alwaysSame bool
+}
+
+func newReplayTrial(alwaysSame bool) *replayTrial {
+	return &replayTrial{
+		uses:       map[string]int{},
+		last:       map[string]string{},
+		tasks:      map[string]string{},
+		alwaysSame: alwaysSame,
+	}
+}
+
+func (f *replayTrial) handler() http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/minimax-trial/video-generation", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(8 << 20); err != nil {
+			http.Error(w, "bad form", http.StatusBadRequest)
+			return
+		}
+		xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
+
+		f.mu.Lock()
+		defer f.mu.Unlock()
+
+		var id string
+		switch {
+		case f.alwaysSame:
+			if _, ok := f.tasks["up-dup"]; !ok {
+				f.tasks["up-dup"] = "MP4-of-up-dup"
+			}
+			id = "up-dup"
+		default:
+			f.uses[xff]++
+			if f.uses[xff] > 2 {
+				// Quota spent: hand back the task this key already produced.
+				id = f.last[xff]
+			} else {
+				f.seq++
+				id = fmt.Sprintf("up-%d", f.seq)
+				f.last[xff] = id
+				f.tasks[id] = "MP4-of-" + id
+			}
+		}
+
+		// Always claim quota is left, so the address is kept in the pool.
+		writeJSON(w, map[string]any{
+			"task_id": id, "access_token": "tok-" + id, "status": "queued",
+			"limit": 2, "remaining": 1, "max_concurrent": 5,
+		})
+	})
+
+	mux.HandleFunc("/api/minimax-trial/video-generation/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/content") {
+			name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/minimax-trial/video-generation/"), "/content")
+			f.mu.Lock()
+			body, ok := f.tasks[name]
+			f.mu.Unlock()
+			if !ok {
+				http.Error(w, "gone", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "video/mp4")
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		writeJSON(w, map[string]any{"status": "succeeded", "task_id": "up"})
+	})
+
+	return mux
+}
+
+// settle waits for a task to reach a terminal state and returns its final copy.
+func settle(t *testing.T, h *harness, id string) *model.Task {
+	t.Helper()
+	if !waitFor(t, 20*time.Second, func() bool {
+		cur, ok := h.store.GetTask(id)
+		return ok && cur.Terminal()
+	}) {
+		cur, _ := h.store.GetTask(id)
+		t.Fatalf("task %s never settled: %+v", id, cur)
+	}
+	cur, _ := h.store.GetTask(id)
+	return cur
+}
+
+// TestSubmitRotatesWhenUpstreamHandsBackAnEarlierTask is the regression test for
+// "after two videos, the next generation returned the second one": upstream
+// answered the third submission with the task of the second, and the gateway
+// recorded it as a brand new job.
+func TestSubmitRotatesWhenUpstreamHandsBackAnEarlierTask(t *testing.T) {
+	fake := newReplayTrial(false)
+	srv := httptest.NewServer(fake.handler())
+	t.Cleanup(srv.Close)
+
+	h := newHarnessOn(t, srv, func(s *config.Settings) {
+		s.XFFMode = config.XFFIPv4
+		s.PollIntervalSec = 0.2
+	})
+
+	seenUpstream := map[string]string{} // upstream task id -> local task id
+	var videos []string
+	for i := 1; i <= 3; i++ {
+		task, err := h.pipe.Submit(context.Background(), SubmitRequest{Image: jpegBytes, Filename: "r.jpg"})
+		if err != nil {
+			t.Fatalf("generation %d: %v", i, err)
+		}
+		got := settle(t, h, task.ID)
+		if got.Status != model.StatusSucceeded {
+			t.Fatalf("generation %d ended %s: %s", i, got.Status, got.Error)
+		}
+		if prev, dup := seenUpstream[got.UpstreamTaskID]; dup {
+			t.Fatalf("generation %d reused upstream task %s from %s", i, got.UpstreamTaskID, prev)
+		}
+		seenUpstream[got.UpstreamTaskID] = got.ID
+
+		body, _, err := h.pipe.Content(context.Background(), got)
+		if err != nil {
+			t.Fatalf("generation %d content: %v", i, err)
+		}
+		for j, prev := range videos {
+			if string(body) == prev {
+				t.Fatalf("generation %d returned the same video as generation %d", i, j+1)
+			}
+		}
+		videos = append(videos, string(body))
+	}
+
+	// The spent address must have been retired instead of reused forever.
+	if st := h.pipe.Rotator().Stats(); st.IdentitiesExhausted == 0 {
+		t.Fatalf("expected the replayed address to be retired: %+v", st)
+	}
+}
+
+// TestSubmitGivesUpWhenUpstreamAlwaysReplays makes sure a wrong video is never
+// handed out: if upstream keeps answering with a task the caller already has,
+// the submission fails loudly instead of duplicating the old result.
+func TestSubmitGivesUpWhenUpstreamAlwaysReplays(t *testing.T) {
+	fake := newReplayTrial(true)
+	srv := httptest.NewServer(fake.handler())
+	t.Cleanup(srv.Close)
+
+	h := newHarnessOn(t, srv, func(s *config.Settings) {
+		s.XFFMode = config.XFFIPv4
+		s.PollIntervalSec = 0.2
+	})
+
+	first, err := h.pipe.Submit(context.Background(), SubmitRequest{Image: jpegBytes, Filename: "r.jpg"})
+	if err != nil {
+		t.Fatalf("first submit: %v", err)
+	}
+	settle(t, h, first.ID)
+
+	if _, err := h.pipe.Submit(context.Background(), SubmitRequest{Image: jpegBytes, Filename: "r.jpg"}); !errors.Is(err, ErrUpstreamReplay) {
+		t.Fatalf("second submit error = %v, want ErrUpstreamReplay", err)
+	}
+
+	_, total := h.store.ListTasks(store.TaskFilter{})
+	if total != 1 {
+		t.Fatalf("a replayed task must not be recorded, total = %d", total)
+	}
+}
+
+// TestSubmitUsesAFreshIdempotencyKeyPerGeneration guards the header that tells
+// upstream "this is a new request": reusing it is what invites the replay.
+func TestSubmitUsesAFreshIdempotencyKeyPerGeneration(t *testing.T) {
+	var mu sync.Mutex
+	keys := map[string]int{}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/content") {
+			w.Header().Set("Content-Type", "video/mp4")
+			_, _ = w.Write([]byte("MP4"))
+			return
+		}
+		if r.Method == http.MethodPost {
+			mu.Lock()
+			keys[r.Header.Get("Idempotency-Key")]++
+			n := len(keys)
+			mu.Unlock()
+			id := fmt.Sprintf("up-%d", n)
+			writeJSON(w, map[string]any{
+				"task_id": id, "access_token": "tok-" + id, "status": "queued",
+				"limit": 2, "remaining": 1,
+			})
+			return
+		}
+		writeJSON(w, map[string]any{"status": "succeeded"})
+	}))
+	t.Cleanup(srv.Close)
+
+	h := newHarnessOn(t, srv, func(s *config.Settings) {
+		s.XFFMode = config.XFFIPv4
+		s.PollIntervalSec = 0.2
+	})
+
+	for i := 0; i < 3; i++ {
+		if _, err := h.pipe.Submit(context.Background(), SubmitRequest{Image: jpegBytes, Filename: "r.jpg"}); err != nil {
+			t.Fatalf("submit %d: %v", i+1, err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 3 {
+		t.Fatalf("expected 3 distinct Idempotency-Key values, got %d (%v)", len(keys), keys)
+	}
+	for k, n := range keys {
+		if k == "" || n != 1 {
+			t.Fatalf("bad idempotency key %q used %d times", k, n)
+		}
+	}
+}
+
+// jpegBytesB is a second, visibly different payload so a test can tell which
+// image upstream actually rendered.
+var jpegBytesB = []byte{0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 'B', 'B', 'B', 'B', 0x00}
+
+// boundImageTrial models the behaviour the field report describes: upstream
+// remembers the first image it saw for an identity (forged address + client id)
+// and keeps rendering that image for every later submission on it. From the
+// caller's side "changing the picture makes no difference"; only a brand new
+// identity renders the new picture.
+type boundImageTrial struct {
+	mu     sync.Mutex
+	images map[string]string
+	tasks  map[string]string
+	seq    int
+}
+
+func newBoundImageTrial() *boundImageTrial {
+	return &boundImageTrial{images: map[string]string{}, tasks: map[string]string{}}
+}
+
+func (f *boundImageTrial) handler() http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/minimax-trial/video-generation", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(8 << 20); err != nil {
+			http.Error(w, "bad form", http.StatusBadRequest)
+			return
+		}
+		key := strings.TrimSpace(r.Header.Get("X-Forwarded-For")) + "|" + r.FormValue("client_id")
+
+		tag := "A"
+		if file, _, err := r.FormFile("image"); err == nil {
+			body, _ := io.ReadAll(file)
+			_ = file.Close()
+			if strings.Contains(string(body), "BBBB") {
+				tag = "B"
+			}
+		}
+
+		f.mu.Lock()
+		if _, seen := f.images[key]; !seen {
+			f.images[key] = tag
+		}
+		rendered := f.images[key]
+		f.seq++
+		id := fmt.Sprintf("up-%d", f.seq)
+		f.tasks[id] = "MP4-from-" + rendered
+		f.mu.Unlock()
+
+		writeJSON(w, map[string]any{
+			"task_id": id, "access_token": "tok-" + id, "status": "queued",
+			"limit": 2, "remaining": 1, "max_concurrent": 5,
+		})
+	})
+
+	mux.HandleFunc("/api/minimax-trial/video-generation/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/content") {
+			name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/minimax-trial/video-generation/"), "/content")
+			f.mu.Lock()
+			body, ok := f.tasks[name]
+			f.mu.Unlock()
+			if !ok {
+				http.Error(w, "gone", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "video/mp4")
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		writeJSON(w, map[string]any{"status": "succeeded", "task_id": "up"})
+	})
+
+	return mux
+}
+
+// TestEachGenerationRendersTheImageItWasGiven is the regression test for
+// "changing the picture makes no difference, only switching channel renders":
+// with one identity per generation the second request can no longer inherit the
+// first request's image.
+func TestEachGenerationRendersTheImageItWasGiven(t *testing.T) {
+	fake := newBoundImageTrial()
+	srv := httptest.NewServer(fake.handler())
+	t.Cleanup(srv.Close)
+
+	h := newHarnessOn(t, srv, func(s *config.Settings) {
+		s.XFFMode = config.XFFIPv4
+		s.PollIntervalSec = 0.2
+	})
+
+	render := func(image []byte) string {
+		t.Helper()
+		task, err := h.pipe.Submit(context.Background(), SubmitRequest{Image: image, Filename: "r.jpg"})
+		if err != nil {
+			t.Fatalf("submit: %v", err)
+		}
+		cur := settle(t, h, task.ID)
+		if cur.Status != model.StatusSucceeded {
+			t.Fatalf("task ended %s: %s", cur.Status, cur.Error)
+		}
+		body, _, err := h.pipe.Content(context.Background(), cur)
+		if err != nil {
+			t.Fatalf("content: %v", err)
+		}
+		return string(body)
+	}
+
+	if got := render(jpegBytes); got != "MP4-from-A" {
+		t.Fatalf("first generation rendered %q, want MP4-from-A", got)
+	}
+	if got := render(jpegBytesB); got != "MP4-from-B" {
+		t.Fatalf("second generation rendered %q, want MP4-from-B — the new image was ignored", got)
+	}
+	if got := render(jpegBytes); got != "MP4-from-A" {
+		t.Fatalf("third generation rendered %q, want MP4-from-A", got)
+	}
 }

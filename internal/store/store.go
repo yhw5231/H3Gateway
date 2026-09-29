@@ -171,6 +171,27 @@ func (s *Store) GetTask(id string) (*model.Task, bool) {
 	return t, ok
 }
 
+// TaskByUpstreamID returns the task already tracking an upstream task id.
+//
+// The gateway uses this to notice that upstream answered a fresh submission
+// with a task it had created earlier (an idempotent replay, or a spent quota key
+// handing back its last task). Recording such an answer as a new task would make
+// the caller download a video that was already delivered.
+func (s *Store) TaskByUpstreamID(upstreamID string) (*model.Task, bool) {
+	if upstreamID == "" {
+		return nil, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, id := range s.order {
+		t := s.tasks[id]
+		if t != nil && t.UpstreamTaskID == upstreamID {
+			return t, true
+		}
+	}
+	return nil, false
+}
+
 // TaskFilter narrows ListTasks.
 type TaskFilter struct {
 	Status string

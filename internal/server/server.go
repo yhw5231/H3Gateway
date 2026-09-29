@@ -446,7 +446,6 @@ func (s *Server) handleTrialUsage(w http.ResponseWriter, r *http.Request) {
 		"enabled":            true,
 		"in_flight":          stats.InFlight,
 		"max_concurrent":     stats.MaxConcurrent,
-		"pool_ready":         stats.Rotator.PoolReady,
 		"xff_mode":           settings.XFFMode,
 		"effective_xff_mode": identity.EffectiveMode(settings, probe),
 		"ipv6_supported":     probe != nil && probe.OK && probe.IPv6Accepted,

@@ -3,11 +3,13 @@ package upstream
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -203,6 +205,71 @@ func TestSubmitWithoutRemainingFieldMarksItUnknown(t *testing.T) {
 	}
 	if res.RemainingKnown {
 		t.Fatal("a missing remaining field must not be treated as zero")
+	}
+}
+
+func TestSubmitNeverReusesAnIdempotencyKey(t *testing.T) {
+	var mu sync.Mutex
+	var keys []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		n := len(keys)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"task_id":"t%d","access_token":"tok","status":"queued","remaining":1}`, n)))
+	}))
+	defer srv.Close()
+
+	c := New(testSettings(srv.URL))
+	defer c.Close()
+
+	// The very same identity, twice: one forged address is worth two upstream
+	// generations, but each submission must still look like a new request,
+	// otherwise upstream answers with the task it created the first time.
+	ident := &identity.Identity{ClientID: "mmtrial_same", VisitorID: "mmguest_same", ForgedIP: "1.2.3.4"}
+	for i := 0; i < 2; i++ {
+		if _, err := c.Submit(context.Background(), SubmitOptions{Image: []byte{0xff, 0xd8, 0xff}}, ident, ""); err != nil {
+			t.Fatalf("Submit %d: %v", i+1, err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 2 {
+		t.Fatalf("captured %d keys, want 2", len(keys))
+	}
+	if keys[0] == "" || keys[1] == "" {
+		t.Fatalf("empty Idempotency-Key: %v", keys)
+	}
+	if keys[0] == keys[1] {
+		t.Fatalf("two submissions shared the Idempotency-Key %q; upstream would replay the first task", keys[0])
+	}
+	if keys[0] == ident.ClientID || keys[1] == ident.ClientID {
+		t.Fatal("the Idempotency-Key must not be derived from the identity, which is reused per address")
+	}
+}
+
+func TestSubmitHonoursAnExplicitIdempotencyKey(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("Idempotency-Key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"task_id":"t1","access_token":"tok","status":"queued","remaining":1}`))
+	}))
+	defer srv.Close()
+
+	c := New(testSettings(srv.URL))
+	defer c.Close()
+	ident := &identity.Identity{ClientID: "c", VisitorID: "v", ForgedIP: "1.2.3.4"}
+	if _, err := c.Submit(context.Background(), SubmitOptions{
+		Image: []byte{0xff, 0xd8, 0xff}, IdempotencyKey: "retry-of-the-same-generation",
+	}, ident, ""); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if got != "retry-of-the-same-generation" {
+		t.Fatalf("explicit key ignored: %q", got)
 	}
 }
 
