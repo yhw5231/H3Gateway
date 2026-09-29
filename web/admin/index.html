@@ -213,7 +213,7 @@
           <input type="text" id="set-showcase" />
         </label>
         <label class="field">
-          <span class="lb">默认提示词 <span class="muted small">（plain 通道上游会忽略 prompt）</span></span>
+          <span class="lb">默认提示词 <span class="muted small">（调用方不传 prompt 时套用；会转发给上游，上游是否采纳取决于通道）</span></span>
           <textarea id="set-prompt" rows="3"></textarea>
         </label>
       </div>
