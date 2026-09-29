@@ -392,6 +392,8 @@ async function showTask(id) {
         <dt>创建时间</dt><dd>${fmtTime(t.created_at)}</dd>
         <dt>更新时间</dt><dd>${fmtTime(t.updated_at)}</dd>
         <dt>本地缓存</dt><dd>视频 ${t.video_cached ? "有" : "无"} · 输入图 ${t.input_cached ? "有" : "无"}</dd>
+        ${t.sha256 ? `<dt>成片 SHA-256</dt><dd class="mono small" title="${esc(t.sha256)}">${esc(t.sha256.slice(0, 16))}…</dd>` : ""}
+        ${t.duplicate ? `<dt>重复内容</dt><dd style="color:#ffa3aa">与任务 <span class="mono">${esc(t.duplicate)}</span> 的成片字节完全相同（输入图不同）——上游复用了同一条内容</dd>` : ""}
         <dt>提示词</dt><dd>${esc(t.prompt || "（空）")}</dd>
         ${t.error ? `<dt>错误</dt><dd style="color:#ffa3aa">${esc(t.error)}</dd>` : ""}
       </dl>

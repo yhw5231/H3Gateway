@@ -56,7 +56,9 @@ type fakeTrial struct {
 	videoBody []byte
 	// forgedIPs records the XFF value seen on each accepted submit.
 	forgedIPs []string
-	lastAuth  string
+	// prompts records the `prompt` form field seen on each accepted submit.
+	prompts  []string
+	lastAuth string
 }
 
 func (f *fakeTrial) handler() http.Handler {
@@ -92,6 +94,7 @@ func (f *fakeTrial) handler() http.Handler {
 		}
 		f.submissions++
 		f.forgedIPs = append(f.forgedIPs, xff)
+		f.prompts = append(f.prompts, r.FormValue("prompt"))
 		id := fmt.Sprintf("up-%d", f.submissions)
 		payload := map[string]any{
 			"task_id": id, "access_token": "tok-" + id, "status": "queued",
@@ -1140,5 +1143,97 @@ func TestEachGenerationRendersTheImageItWasGiven(t *testing.T) {
 	}
 	if got := render(jpegBytes); got != "MP4-from-A" {
 		t.Fatalf("third generation rendered %q, want MP4-from-A", got)
+	}
+}
+
+// TestDefaultPromptIsForwardedWhenTheCallerSendsNone covers the `default_prompt`
+// setting: it was documented but never read, so a request without its own prompt
+// forwarded nothing at all and the operator had no way to steer the channel.
+func TestDefaultPromptIsForwardedWhenTheCallerSendsNone(t *testing.T) {
+	fake := &fakeTrial{videoBody: []byte("MP4DATA")}
+	h := newHarness(t, nil, fake)
+
+	first, err := h.pipe.Submit(context.Background(), SubmitRequest{Image: jpegBytes, Filename: "a.jpg"})
+	if err != nil {
+		t.Fatalf("submit without prompt: %v", err)
+	}
+	settle(t, h, first.ID)
+
+	second, err := h.pipe.Submit(context.Background(), SubmitRequest{
+		Image: jpegBytesB, Filename: "b.jpg", Prompt: "a red apple on a wooden table",
+	})
+	if err != nil {
+		t.Fatalf("submit with prompt: %v", err)
+	}
+	settle(t, h, second.ID)
+
+	fake.mu.Lock()
+	got := append([]string(nil), fake.prompts...)
+	fake.mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("upstream saw %d submits, want 2: %q", len(got), got)
+	}
+	want := h.store.Settings().DefaultPrompt
+	if want == "" {
+		t.Fatalf("default prompt is empty")
+	}
+	if got[0] != want {
+		t.Fatalf("default prompt not forwarded: upstream got %q, want %q", got[0], want)
+	}
+	if got[1] != "a red apple on a wooden table" {
+		t.Fatalf("an explicit caller prompt must win: upstream got %q", got[1])
+	}
+	if stored, _ := h.store.GetTask(first.ID); stored.Prompt != want {
+		t.Fatalf("task prompt = %q, want the applied default %q", stored.Prompt, want)
+	}
+}
+
+// TestRepeatedVideoForAnotherImageIsFlagged covers an upstream that answers a
+// fresh task id with content it already produced. The task-id replay guard cannot
+// see that, so the content hash has to — and it must stay quiet when the very
+// same picture is simply rendered twice.
+func TestRepeatedVideoForAnotherImageIsFlagged(t *testing.T) {
+	fake := &fakeTrial{videoBody: []byte("ONE-AND-THE-SAME-FILM")}
+	h := newHarness(t, nil, fake)
+
+	waitHash := func(id string) *model.Task {
+		t.Helper()
+		if !waitFor(t, 20*time.Second, func() bool {
+			cur, ok := h.store.GetTask(id)
+			return ok && cur.VideoSHA256 != ""
+		}) {
+			cur, _ := h.store.GetTask(id)
+			t.Fatalf("task %s never recorded a content hash: %+v", id, cur)
+		}
+		cur, _ := h.store.GetTask(id)
+		return cur
+	}
+	render := func(image []byte) *model.Task {
+		t.Helper()
+		task, err := h.pipe.Submit(context.Background(), SubmitRequest{Image: image, Filename: "r.jpg"})
+		if err != nil {
+			t.Fatalf("submit: %v", err)
+		}
+		settle(t, h, task.ID)
+		return waitHash(task.ID)
+	}
+
+	// Same picture twice: a cached render, not a bug.
+	same := render(jpegBytes)
+	again := render(jpegBytes)
+	if same.VideoSHA256 != again.VideoSHA256 {
+		t.Fatalf("fixture broken: hashes differ (%q vs %q)", same.VideoSHA256, again.VideoSHA256)
+	}
+	if again.DuplicateOf != "" {
+		t.Fatalf("re-rendering the same image was flagged as a duplicate: %+v", again)
+	}
+
+	// A different picture that renders the identical film is the real signal.
+	other := render(jpegBytesB)
+	if other.DuplicateOf != same.ID {
+		t.Fatalf("identical video for a different image was not flagged: %+v", other)
+	}
+	if other.InputSHA256 == same.InputSHA256 {
+		t.Fatalf("fixture broken: both tasks recorded the same input hash")
 	}
 }

@@ -192,6 +192,27 @@ func (s *Store) TaskByUpstreamID(upstreamID string) (*model.Task, bool) {
 	return nil, false
 }
 
+// TaskByVideoHash returns the oldest task that already delivered these exact
+// video bytes, i.e. whoever produced that content first.
+//
+// A task id only proves which job upstream accepted, not what it rendered: an
+// upstream that hands a canned render to a fresh task id would look healthy
+// while every caller downloads the same film. Comparing content hashes is the
+// only check that catches it.
+func (s *Store) TaskByVideoHash(hash string) (*model.Task, bool) {
+	if hash == "" {
+		return nil, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for i := len(s.order) - 1; i >= 0; i-- {
+		if t := s.tasks[s.order[i]]; t != nil && t.VideoSHA256 == hash {
+			return t, true
+		}
+	}
+	return nil, false
+}
+
 // TaskFilter narrows ListTasks.
 type TaskFilter struct {
 	Status string

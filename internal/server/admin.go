@@ -268,6 +268,8 @@ func taskSummary(t *model.Task) map[string]any {
 		"api_key":    t.APIKeyTag,
 		"source":     t.Source,
 		"upstream":   t.UpstreamTaskID,
+		"sha256":     t.VideoSHA256,
+		"duplicate":  t.DuplicateOf,
 	}
 }
 

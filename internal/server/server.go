@@ -548,6 +548,15 @@ func taskToVideoObject(t *model.Task, base string) map[string]any {
 	if t.Error != "" {
 		obj["failure_reason"] = t.Error
 	}
+	if t.VideoSHA256 != "" {
+		obj["video_sha256"] = t.VideoSHA256
+	}
+	if t.DuplicateOf != "" {
+		// Upstream answered this task with content it had already produced. The
+		// video is not this request's own render; say so instead of letting the
+		// caller discover it by eye.
+		obj["duplicate_of"] = t.DuplicateOf
+	}
 	return obj
 }
 

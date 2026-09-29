@@ -158,7 +158,7 @@ func DefaultSettings() Settings {
 		TrialBase:     "/api/minimax-trial",
 		EndpointMode:  EndpointPlain,
 		ShowcaseID:    "case-mtqzygu8",
-		DefaultPrompt: "Animate the scene in the image with natural, faithful motion. Keep the subject and setting consistent with the input image.",
+		DefaultPrompt: "Animate the input image with natural, faithful motion. Keep the subject, appearance, clothing and setting exactly as in the image; never replace the subject with a person, and never add people or gestures that are not present in the image.",
 		UserAgent:     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 		Referer:       "https://siftq.com/minimax-h3/try/zh",
 

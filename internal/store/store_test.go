@@ -388,3 +388,31 @@ func TestOverrideSecret(t *testing.T) {
 		t.Fatal("a blank override must be ignored")
 	}
 }
+
+// TestTaskByVideoHashNamesTheOriginal covers the duplicate-content check: two
+// tasks delivering identical bytes must resolve to whichever produced them first,
+// so a caller seeing the same film twice learns where it came from.
+func TestTaskByVideoHashNamesTheOriginal(t *testing.T) {
+	st := newTestStore(t)
+
+	original := mkTask("video_original", model.StatusSucceeded)
+	original.VideoSHA256 = "hash-shared"
+	original.InputSHA256 = "image-a"
+	st.SaveTask(original)
+
+	copycat := mkTask("video_copycat", model.StatusSucceeded)
+	copycat.VideoSHA256 = "hash-shared"
+	copycat.InputSHA256 = "image-b"
+	st.SaveTask(copycat)
+
+	got, ok := st.TaskByVideoHash("hash-shared")
+	if !ok || got.ID != original.ID {
+		t.Fatalf("TaskByVideoHash = %v, %v; want the original %s", got, ok, original.ID)
+	}
+	if _, ok := st.TaskByVideoHash("hash-unknown"); ok {
+		t.Fatal("an unknown hash must not resolve")
+	}
+	if _, ok := st.TaskByVideoHash(""); ok {
+		t.Fatal("an empty hash must not resolve")
+	}
+}

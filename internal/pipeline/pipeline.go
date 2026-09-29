@@ -5,6 +5,8 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -202,6 +204,14 @@ func (p *Pipeline) Submit(ctx context.Context, req SubmitRequest) (*model.Task, 
 	if req.Model == "" {
 		req.Model = "minimax-h3"
 	}
+	if strings.TrimSpace(req.Prompt) == "" {
+		// The channel is free to ignore `prompt` (the upstream trial front-end
+		// never sends one), but the gateway must still honour its own documented
+		// default instead of forwarding nothing: leaving it empty made the
+		// `default_prompt` setting a silent no-op. An explicit caller prompt
+		// always wins.
+		req.Prompt = strings.TrimSpace(settings.DefaultPrompt)
+	}
 
 	p.sem.SetMax(settings.MaxConcurrent)
 	release, err := p.sem.Acquire(ctx)
@@ -338,6 +348,7 @@ func (p *Pipeline) newTask(req SubmitRequest, ident *identity.Identity, res *ups
 		Ratio:          req.Ratio,
 		Duration:       req.Duration,
 		Prompt:         req.Prompt,
+		InputSHA256:    hashBytes(req.Image),
 		UpstreamTaskID: res.TaskID,
 		AccessToken:    res.AccessToken,
 		ClientID:       ident.ClientID,
@@ -573,7 +584,44 @@ func (p *Pipeline) cacheVideo(ctx context.Context, t *model.Task) {
 	}
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		p.log.Warn("cannot write cached video", "task", t.ID, "err", err)
+		return
 	}
+	p.recordVideoHash(t, data)
+}
+
+// recordVideoHash stores the content hash of a cached MP4 and marks the task when
+// those exact bytes were already delivered for a *different* input image.
+//
+// The upstream trial channel animates whatever first frame it is given, so a
+// repeated video is either a cached render of the same picture (harmless) or
+// content that had nothing to do with this request (exactly the "every video
+// shows the same woman" report). The hashes tell the two apart instead of
+// leaving it to the eye.
+func (p *Pipeline) recordVideoHash(t *model.Task, data []byte) {
+	hash := hashBytes(data)
+	if t.VideoSHA256 == hash {
+		return
+	}
+	other, dup := p.store.TaskByVideoHash(hash)
+	t.VideoSHA256 = hash
+	if dup && other.ID != t.ID {
+		if other.InputSHA256 != "" && other.InputSHA256 != t.InputSHA256 {
+			t.DuplicateOf = other.ID
+			p.log.Warn("upstream delivered content it had already produced for another image",
+				"task", t.ID, "upstream", t.UpstreamTaskID,
+				"same_as", other.ID, "same_upstream", other.UpstreamTaskID, "sha256", hash)
+		} else {
+			p.log.Debug("upstream returned the same bytes for the same input image",
+				"task", t.ID, "same_as", other.ID, "sha256", hash)
+		}
+	}
+	p.store.SaveTask(t)
+}
+
+// hashBytes is the hex SHA-256 of a cached input image or finished video.
+func hashBytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 // Content serves the MP4, preferring the local cache and falling back to
@@ -593,6 +641,8 @@ func (p *Pipeline) Content(ctx context.Context, t *model.Task) ([]byte, string, 
 	}
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		p.log.Warn("cannot cache video after download", "task", t.ID, "err", err)
+	} else {
+		p.recordVideoHash(t, data)
 	}
 	return data, media, nil
 }

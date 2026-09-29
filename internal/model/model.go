@@ -44,6 +44,16 @@ type Task struct {
 	VideoURL string `json:"video_url,omitempty"`
 	Error    string `json:"error,omitempty"`
 
+	// VideoSHA256 hashes the cached MP4. Upstream can answer a brand new task id
+	// with content it already produced (a canned or cached render), which is
+	// invisible to an id-based check; DuplicateOf then names the first task that
+	// delivered the very same bytes for a *different* input image.
+	VideoSHA256 string `json:"video_sha256,omitempty"`
+	DuplicateOf string `json:"duplicate_of,omitempty"`
+	// InputSHA256 hashes the uploaded first frame, so a repeated video can be
+	// told apart from a legitimate re-render of the same picture.
+	InputSHA256 string `json:"input_sha256,omitempty"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Attempts  int       `json:"attempts"`
